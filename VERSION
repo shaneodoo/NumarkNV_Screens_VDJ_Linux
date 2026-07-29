@@ -1,0 +1,5 @@
+pack: numark-nv-vdj-linux
+edition: production-required-only
+wake: open (splash)
+live: VDJ SysEx only
+note: no test/probe/capture-loop tools

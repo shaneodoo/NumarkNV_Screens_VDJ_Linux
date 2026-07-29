@@ -1,0 +1,7 @@
+# Numark NV — ensure user access to Control / Graphics / Audio USB interfaces
+# VID 15e4 = Numark
+SUBSYSTEM=="usb", ATTR{idVendor}=="15e4", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="sound", ATTRS{idVendor}=="15e4", MODE="0666", TAG+="uaccess"
+KERNEL=="midiC*D*", ATTRS{idVendor}=="15e4", MODE="0666", TAG+="uaccess"
+KERNEL=="controlC*", ATTRS{idVendor}=="15e4", MODE="0666", TAG+="uaccess"
+KERNEL=="pcmC*D*", ATTRS{idVendor}=="15e4", MODE="0666", TAG+="uaccess"
