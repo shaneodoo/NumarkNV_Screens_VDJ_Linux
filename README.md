@@ -2,6 +2,8 @@
 
 Make VirtualDJ (Wine) drive your **Numark NV** on Linux: pads, **both LCDs**, and NV audio when available.
 
+##THIS HAS ONLY BEEN TESTED ON NUMARK NV NOT NUMARK NV2##
+
 ## Install (easy)
 
 ```bash
