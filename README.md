@@ -47,28 +47,18 @@ On exit, bulk is released and a USB re-enum restores stock NV logos.
 python3 bin/nv-screens --patchbay --live-only --wake-mode open --no-wait
 ```
 
-## Install (optional)
+## Install
+
+**→ Step-by-step:** **[INSTALL.md](INSTALL.md)** (easy install guide)
 
 ```bash
+git clone https://github.com/shaneodoo/NumarkNV_Screens_VDJ_Linux.git
+cd NumarkNV_Screens_VDJ_Linux
 ./install.sh
-# Installs into ~/src/nv-screens by default and links ~/bin/start-virtualdj.sh
+start-virtualdj.sh
 ```
 
-USB access (udev):
-
-```bash
-sudo cp config/udev/99-numark-nv.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-Passwordless logo restore on exit (sudoers), **new path**:
-
-```text
-youruser ALL=(root) NOPASSWD: /home/YOUR/src/nv-screens/scripts/usb-reset-nv.sh
-```
-
-A compatibility wrapper remains at `tools/usb-reset-nv.sh` if your sudoers still
-points at the 1.0.x path.
+`install.sh` copies into `~/src/nv-screens` by default and links `~/bin/start-virtualdj.sh`.
 
 ## What’s new in 1.1.0
 

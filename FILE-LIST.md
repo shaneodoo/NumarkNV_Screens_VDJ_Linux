@@ -17,3 +17,4 @@ Runtime only — no capture dumps, snapshots, or RE probes.
 | `docs/` | Public docs |
 | `install.sh` | Installer |
 | `VERSION` / `CHANGELOG.md` | Release metadata |
+| `INSTALL.md` | Easy install guide |
