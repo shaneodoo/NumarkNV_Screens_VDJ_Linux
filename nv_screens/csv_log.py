@@ -55,20 +55,33 @@ class CsvTrafficLog:
         new = not self.path.exists() or self.path.stat().st_size == 0
         self._fp = self.path.open("a", newline="", encoding="utf-8")
         self._w = csv.DictWriter(self._fp, fieldnames=self.fields, extrasaction="ignore")
+        self._closed = False
         if new:
             self._w.writeheader()
             self._fp.flush()
 
     def close(self) -> None:
+        """Idempotent close — safe if MIDI thread races with shutdown."""
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            fp = self._fp
+            self._fp = None
+            self._w = None
+            if fp is None:
+                return
             try:
-                self._fp.flush()
-                self._fp.close()
+                if not fp.closed:
+                    fp.flush()
+                    fp.close()
             except Exception:
                 pass
 
     def write(self, row: dict[str, Any]) -> None:
         with self._lock:
+            if self._closed or self._fp is None or self._w is None:
+                return
             self._seq += 1
             base = {
                 "ts_mono": f"{time.monotonic() - self._t0:.6f}",
@@ -90,9 +103,13 @@ class CsvTrafficLog:
                     out[k] = v[: self.max_hex] + "…"
                 else:
                     out[k] = "" if v is None else str(v)
-            self._w.writerow(out)
-            if self._seq % 50 == 0:
-                self._fp.flush()
+            try:
+                self._w.writerow(out)
+                if self._seq % 50 == 0:
+                    self._fp.flush()
+            except Exception:
+                # Shutdown race: file already closing
+                return
 
     def write_many(self, rows: Iterable[dict[str, Any]]) -> None:
         for r in rows:

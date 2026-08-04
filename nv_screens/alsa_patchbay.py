@@ -111,11 +111,32 @@ class _SndSeqEvExt(ctypes.Structure):
     _fields_ = [("len", ctypes.c_uint), ("ptr", ctypes.c_void_p)]
 
 
+class _SndSeqEvNote(ctypes.Structure):
+    _fields_ = [
+        ("channel", ctypes.c_ubyte),
+        ("note", ctypes.c_ubyte),
+        ("velocity", ctypes.c_ubyte),
+        ("off_velocity", ctypes.c_ubyte),
+        ("duration", ctypes.c_uint),
+    ]
+
+
+class _SndSeqEvCtrl(ctypes.Structure):
+    _fields_ = [
+        ("channel", ctypes.c_ubyte),
+        ("unused", ctypes.c_ubyte * 3),
+        ("param", ctypes.c_uint),
+        ("value", ctypes.c_int),
+    ]
+
+
 class _SndSeqEventData(ctypes.Union):
     # Largest legacy member is 12 bytes (raw8 / queue param); ext is packed 12.
     _fields_ = [
         ("raw8", ctypes.c_ubyte * 12),
         ("ext", _SndSeqEvExt),
+        ("note", _SndSeqEvNote),
+        ("control", _SndSeqEvCtrl),
     ]
 
 
@@ -378,6 +399,10 @@ class _SeqClient:
         self._stop = threading.Event()
         self.on_midi: Callable[[str, bytes], None] | None = None
         self.on_event: Callable[[dict], None] | None = None
+        # HW Control → host (browse knobs, jogs) after rebroadcast to Wine
+        self.on_control_midi: Callable[[bytes], None] | None = None
+        # Wine → Control LEDs (browser-focus blink detect)
+        self.on_wine_control: Callable[[bytes], None] | None = None
         self.stats = {
             "events": 0,
             "sysex": 0,
@@ -387,6 +412,9 @@ class _SeqClient:
             "bytes": 0,
             "id_req": 0,
             "id_reply": 0,
+            "ctl_hw": 0,
+            "ctl_hw_ok": 0,
+            "ctl_hw_fail": 0,
         }
         # Keep identity payload buffers alive while ALSA drains output
         self._id_bufs: dict[int, ctypes.Array] = {}
@@ -421,12 +449,23 @@ class _SeqClient:
         )
 
     def close(self) -> None:
+        """Stop pump, drop callbacks, then close seq (avoid use-after-free SEGV)."""
         self._stop.set()
+        # Prevent late events writing into dead host objects
+        self.on_midi = None
+        self.on_event = None
+        self.on_control_midi = None
+        self.on_wine_control = None
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.5)
-        if self._seq:
-            _asound.snd_seq_close(self._seq)
-            self._seq = ctypes.c_void_p()
+            self._thread.join(timeout=2.5)
+        seq = self._seq
+        self._seq = ctypes.c_void_p()
+        if seq:
+            try:
+                _asound.snd_seq_close(seq)
+            except Exception:
+                pass
+        self._thread = None
 
     def start_input_watch(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -437,21 +476,25 @@ class _SeqClient:
         )
         self._thread.start()
 
-    def _dest_port(self, ev_ptr: ctypes.c_void_p) -> int | None:
-        """Read dest.port from raw snd_seq_event_t (offset 15)."""
+    def _ev_from_ptr(self, ev_ptr: ctypes.c_void_p) -> _SndSeqEvent | None:
+        """Cast snd_seq_event input pointer to our structure view."""
         try:
-            # ev_ptr is pointer to event; cast to byte array of 28
-            base = ctypes.cast(ev_ptr, ctypes.POINTER(ctypes.c_ubyte))
-            return int(base[15])
+            return ctypes.cast(ev_ptr, ctypes.POINTER(_SndSeqEvent)).contents
         except Exception:
             return None
 
-    def _source_client(self, ev_ptr: ctypes.c_void_p) -> int | None:
-        try:
-            base = ctypes.cast(ev_ptr, ctypes.POINTER(ctypes.c_ubyte))
-            return int(base[12])
-        except Exception:
+    def _dest_port(self, ev_ptr: ctypes.c_void_p) -> int | None:
+        """Read dest.port from snd_seq_event_t."""
+        ev = self._ev_from_ptr(ev_ptr)
+        if ev is None:
             return None
+        return int(ev.dest.port)
+
+    def _source_client(self, ev_ptr: ctypes.c_void_p) -> int | None:
+        ev = self._ev_from_ptr(ev_ptr)
+        if ev is None:
+            return None
+        return int(ev.source.client)
 
     def bridge_kernel_control(self, control_port_name: str = "NV Control") -> bool:
         """Bidirectional ALSA link: facade Control ↔ kernel NV Control MIDI."""
@@ -497,6 +540,64 @@ class _SeqClient:
         )
         return e1 >= 0 or e2 >= 0
 
+    def _raw_to_seq_event(self, raw: bytes) -> _SndSeqEvent | None:
+        """Build a fixed-length ALSA seq event from short raw MIDI bytes."""
+        if not raw:
+            return None
+        st = raw[0]
+        hi = st & 0xF0
+        ch = st & 0x0F
+        ev = _SndSeqEvent()
+        ev.flags = 0
+        ev.tag = 0
+        ev.queue = SND_SEQ_QUEUE_DIRECT
+        if hi == 0xB0 and len(raw) >= 3:
+            ev.type = SND_SEQ_EVENT_CONTROLLER
+            ev.data.control.channel = ch
+            ev.data.control.param = int(raw[1]) & 0x7F
+            ev.data.control.value = int(raw[2]) & 0x7F
+            return ev
+        if hi in (0x80, 0x90) and len(raw) >= 3:
+            vel = int(raw[2]) & 0x7F
+            # Note-on with vel 0 is note-off
+            if hi == 0x90 and vel > 0:
+                ev.type = SND_SEQ_EVENT_NOTEON
+            else:
+                ev.type = SND_SEQ_EVENT_NOTEOFF
+            ev.data.note.channel = ch
+            ev.data.note.note = int(raw[1]) & 0x7F
+            ev.data.note.velocity = vel
+            ev.data.note.off_velocity = 0
+            ev.data.note.duration = 0
+            return ev
+        if hi == 0xE0 and len(raw) >= 3:
+            # pitch bend: 14-bit → signed -8192..8191
+            val = (int(raw[1]) & 0x7F) | ((int(raw[2]) & 0x7F) << 7)
+            ev.type = SND_SEQ_EVENT_PITCHBEND
+            ev.data.control.channel = ch
+            ev.data.control.param = 0
+            ev.data.control.value = val - 8192
+            return ev
+        if hi == 0xC0 and len(raw) >= 2:
+            ev.type = SND_SEQ_EVENT_PGMCHANGE
+            ev.data.control.channel = ch
+            ev.data.control.param = 0
+            ev.data.control.value = int(raw[1]) & 0x7F
+            return ev
+        if hi == 0xD0 and len(raw) >= 2:
+            ev.type = SND_SEQ_EVENT_CHANPRESS
+            ev.data.control.channel = ch
+            ev.data.control.param = 0
+            ev.data.control.value = int(raw[1]) & 0x7F
+            return ev
+        if hi == 0xA0 and len(raw) >= 3:
+            ev.type = SND_SEQ_EVENT_KEYPRESS
+            ev.data.note.channel = ch
+            ev.data.note.note = int(raw[1]) & 0x7F
+            ev.data.note.velocity = int(raw[2]) & 0x7F
+            return ev
+        return None
+
     def _emit_sysex_to_subscribers(self, port_id: int, payload: bytes) -> None:
         """Rebroadcast SysEx (e.g. from hardware) to Wine subscribers."""
         if not self._seq or not payload:
@@ -518,50 +619,61 @@ class _SeqClient:
             _asound.snd_seq_event_output(self._seq, ctypes.byref(ev))
             _asound.snd_seq_drain_output(self._seq)
 
-    def _emit_raw_to_subscribers(self, port_id: int, raw: bytes) -> None:
+    def _emit_raw_to_subscribers(self, port_id: int, raw: bytes) -> bool:
         """Rebroadcast short MIDI from hardware as if sourced from facade port.
 
         Wine opens Numark NV on the *facade* ALSA address only. Kernel Control
-        events must be re-emitted with source=facade or jogs/pads never reach VDJ.
+        events must be re-emitted with source=facade or jogs/pads/FX knobs
+        never reach VDJ (direct kernel→Wine is the wrong client for NMNV).
         """
         if not self._seq or not raw:
-            return
+            return False
         if raw[0] == 0xF0:
             self._emit_sysex_to_subscribers(port_id, raw)
-            return
-        midi_ev = ctypes.c_void_p()
-        if _asound.snd_midi_event_new(256, ctypes.byref(midi_ev)) < 0:
-            return
-        try:
-            if not hasattr(_asound, "snd_midi_event_encode"):
-                _asound.snd_midi_event_encode.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_ubyte),
-                    ctypes.c_long,
-                    ctypes.c_void_p,
-                ]
-                _asound.snd_midi_event_encode.restype = ctypes.c_long
-            _asound.snd_midi_event_no_status(midi_ev, 1)
-            buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
-            ev = _SndSeqEvent()
-            n = _asound.snd_midi_event_encode(
-                midi_ev, buf, len(raw), ctypes.byref(ev)
-            )
-            if n <= 0:
-                return
-            ev.queue = SND_SEQ_QUEUE_DIRECT
-            ev.source.port = port_id & 0xFF
-            ev.dest.client = SND_SEQ_ADDRESS_SUBSCRIBERS
-            ev.dest.port = SND_SEQ_ADDRESS_UNKNOWN
-            _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
-        finally:
-            _asound.snd_midi_event_free(midi_ev)
+            return True
 
-    def _forward_raw_to_kernel_control(self, port_id: int, raw: bytes) -> None:
+        ev = self._raw_to_seq_event(raw)
+        if ev is None:
+            # Fallback: libasound encoder for rare message types
+            midi_ev = ctypes.c_void_p()
+            if _asound.snd_midi_event_new(256, ctypes.byref(midi_ev)) < 0:
+                return False
+            try:
+                if not hasattr(_asound, "snd_midi_event_encode"):
+                    _asound.snd_midi_event_encode.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_ubyte),
+                        ctypes.c_long,
+                        ctypes.c_void_p,
+                    ]
+                    _asound.snd_midi_event_encode.restype = ctypes.c_long
+                _asound.snd_midi_event_no_status(midi_ev, 1)
+                buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+                ev = _SndSeqEvent()
+                n = _asound.snd_midi_event_encode(
+                    midi_ev, buf, len(raw), ctypes.byref(ev)
+                )
+                if n <= 0:
+                    return False
+            finally:
+                _asound.snd_midi_event_free(midi_ev)
+
+        ev.queue = SND_SEQ_QUEUE_DIRECT
+        ev.source.port = port_id & 0xFF
+        ev.dest.client = SND_SEQ_ADDRESS_SUBSCRIBERS
+        ev.dest.port = SND_SEQ_ADDRESS_UNKNOWN
+        err = _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
+        if err < 0:
+            err = _asound.snd_seq_event_output(self._seq, ctypes.byref(ev))
+            if err >= 0:
+                _asound.snd_seq_drain_output(self._seq)
+        return err >= 0
+
+    def _forward_raw_to_kernel_control(self, port_id: int, raw: bytes) -> bool:
         """Send MIDI bytes to kernel NV Control (Wine → hardware)."""
         kern = getattr(self, "_ctl_kern_client", None)
         if kern is None or not self._seq or not raw:
-            return
+            return False
         # SysEx path
         if raw[0] == 0xF0:
             buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
@@ -575,39 +687,48 @@ class _SeqClient:
             ev.dest.port = 0
             ev.data.ext.len = len(raw)
             ev.data.ext.ptr = ctypes.cast(buf, ctypes.c_void_p)
-            _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
-            return
-        # Short MIDI: use midi encoder
-        midi_ev = ctypes.c_void_p()
-        if _asound.snd_midi_event_new(256, ctypes.byref(midi_ev)) < 0:
-            return
-        try:
-            _asound.snd_midi_event_no_status(midi_ev, 1)
-            # encode_byte is available via encode if we bind it — fallback: wrap as sysex-less direct
-            # Use variable raw by stuffing into SYSEX-like isn't valid.
-            # Bind encode if present
-            if not hasattr(_asound, "snd_midi_event_encode"):
-                _asound.snd_midi_event_encode.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_ubyte),
-                    ctypes.c_long,
-                    ctypes.c_void_p,
-                ]
-                _asound.snd_midi_event_encode.restype = ctypes.c_long
-            ev = _SndSeqEvent()
-            buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
-            n = _asound.snd_midi_event_encode(
-                midi_ev, buf, len(raw), ctypes.byref(ev)
-            )
-            if n <= 0:
-                return
-            ev.queue = SND_SEQ_QUEUE_DIRECT
-            ev.source.port = port_id & 0xFF
-            ev.dest.client = kern & 0xFF
-            ev.dest.port = 0
-            _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
-        finally:
-            _asound.snd_midi_event_free(midi_ev)
+            err = _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
+            if err < 0:
+                err = _asound.snd_seq_event_output(self._seq, ctypes.byref(ev))
+                if err >= 0:
+                    _asound.snd_seq_drain_output(self._seq)
+            return err >= 0
+
+        ev = self._raw_to_seq_event(raw)
+        if ev is None:
+            midi_ev = ctypes.c_void_p()
+            if _asound.snd_midi_event_new(256, ctypes.byref(midi_ev)) < 0:
+                return False
+            try:
+                if not hasattr(_asound, "snd_midi_event_encode"):
+                    _asound.snd_midi_event_encode.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_ubyte),
+                        ctypes.c_long,
+                        ctypes.c_void_p,
+                    ]
+                    _asound.snd_midi_event_encode.restype = ctypes.c_long
+                _asound.snd_midi_event_no_status(midi_ev, 1)
+                buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+                ev = _SndSeqEvent()
+                n = _asound.snd_midi_event_encode(
+                    midi_ev, buf, len(raw), ctypes.byref(ev)
+                )
+                if n <= 0:
+                    return False
+            finally:
+                _asound.snd_midi_event_free(midi_ev)
+
+        ev.queue = SND_SEQ_QUEUE_DIRECT
+        ev.source.port = port_id & 0xFF
+        ev.dest.client = kern & 0xFF
+        ev.dest.port = 0
+        err = _asound.snd_seq_event_output_direct(self._seq, ctypes.byref(ev))
+        if err < 0:
+            err = _asound.snd_seq_event_output(self._seq, ctypes.byref(ev))
+            if err >= 0:
+                _asound.snd_seq_drain_output(self._seq)
+        return err >= 0
 
     def _reply_identity(self, port_id: int, payload: bytes) -> None:
         """Send identity SysEx back out the same port (to subscribers / Wine)."""
@@ -667,13 +788,15 @@ class _SeqClient:
         port_names = {v: k for k, v in self.ports.items()}
 
         while not self._stop.is_set():
-            if not getattr(self._seq, "value", None):
+            seq = self._seq
+            if not seq or not getattr(seq, "value", None):
                 time.sleep(0.05)
                 continue
             try:
-                npoll = _asound.snd_seq_poll_descriptors_count(self._seq, POLLIN)
+                npoll = _asound.snd_seq_poll_descriptors_count(seq, POLLIN)
             except Exception as e:
-                print(f"[patchbay] poll_count error: {e}", flush=True)
+                if not self._stop.is_set():
+                    print(f"[patchbay] poll_count error: {e}", flush=True)
                 time.sleep(0.05)
                 continue
             if npoll <= 0:
@@ -682,25 +805,35 @@ class _SeqClient:
             pfds = (Pollfd * npoll)()
             try:
                 _asound.snd_seq_poll_descriptors(
-                    self._seq, ctypes.byref(pfds), npoll, POLLIN
+                    seq, ctypes.byref(pfds), npoll, POLLIN
                 )
             except Exception as e:
-                print(f"[patchbay] poll_desc error: {e}", flush=True)
+                if not self._stop.is_set():
+                    print(f"[patchbay] poll_desc error: {e}", flush=True)
                 time.sleep(0.05)
                 continue
             try:
                 r, _, _ = select.select(
-                    [pfds[i].fd for i in range(npoll)], [], [], 0.2
+                    [pfds[i].fd for i in range(npoll)], [], [], 0.15
                 )
             except (ValueError, OSError):
                 time.sleep(0.05)
                 continue
+            if self._stop.is_set():
+                break
             if not r:
                 continue
 
             while not self._stop.is_set():
+                if not self._seq or not getattr(self._seq, "value", None):
+                    break
                 ev_ptr = ctypes.c_void_p()
-                err = _asound.snd_seq_event_input(self._seq, ctypes.byref(ev_ptr))
+                try:
+                    err = _asound.snd_seq_event_input(
+                        self._seq, ctypes.byref(ev_ptr)
+                    )
+                except Exception:
+                    break
                 if err < 0 or not ev_ptr:
                     break
                 try:
@@ -762,7 +895,7 @@ class _SeqClient:
 
                     # Control port: identity is answered above; forward other
                     # Wine→HW traffic to kernel NV Control. Hardware→Wine is
-                    # wired separately (kernel Control → WINE input). Never bulk.
+                    # rebroadcast from facade (VDJ binds NMNV to facade only).
                     is_ctl = (
                         port_name == "NV Control"
                         or "1005" in port_name
@@ -775,7 +908,7 @@ class _SeqClient:
                     kern_ctl = getattr(self, "_ctl_kern_client", None)
                     if is_ctl and dest is not None:
                         # Hardware → facade: rebroadcast so Wine (subscribed to
-                        # facade Control only) receives jogs/pads/notes.
+                        # facade Control only) receives jogs/pads/FX knobs.
                         if kern_ctl is not None and src_cli == kern_ctl:
                             # Drop hardware identity replies (we answer probes)
                             if self._is_identity_request(raw):
@@ -788,14 +921,57 @@ class _SeqClient:
                                 and raw[4] == 0x02
                             ):
                                 continue
+                            self.stats["ctl_hw"] = self.stats.get("ctl_hw", 0) + 1
                             try:
-                                self._emit_raw_to_subscribers(dest, raw)
+                                ok = self._emit_raw_to_subscribers(dest, raw)
+                                if ok:
+                                    self.stats["ctl_hw_ok"] = (
+                                        self.stats.get("ctl_hw_ok", 0) + 1
+                                    )
+                                else:
+                                    self.stats["ctl_hw_fail"] = (
+                                        self.stats.get("ctl_hw_fail", 0) + 1
+                                    )
                             except Exception as e:
-                                if self.stats["events"] <= 8:
+                                self.stats["ctl_hw_fail"] = (
+                                    self.stats.get("ctl_hw_fail", 0) + 1
+                                )
+                                if self.stats.get("ctl_hw_fail", 0) <= 8:
                                     print(f"[patchbay] ctl HW→Wine err: {e}", flush=True)
+                            # Host hook (browse-side paint filter, etc.)
+                            if self.on_control_midi:
+                                try:
+                                    self.on_control_midi(raw)
+                                except Exception:
+                                    pass
+                            # Throttled log: proves FX knobs/jogs reach the bridge
+                            n_hw = self.stats.get("ctl_hw", 0)
+                            if n_hw <= 12 or n_hw % 200 == 0:
+                                hx = raw[:8].hex()
+                                print(
+                                    f"[patchbay] ctl HW→Wine #{n_hw} "
+                                    f"hex={hx} ok={self.stats.get('ctl_hw_ok', 0)} "
+                                    f"fail={self.stats.get('ctl_hw_fail', 0)}",
+                                    flush=True,
+                                )
                             continue
                         # Wine → hardware Control LEDs/etc.
                         if not self._is_identity_request(raw):
+                            # Host hook: detect software browser focus (LED blink)
+                            owc = getattr(self, "on_wine_control", None)
+                            if owc is not None and raw and raw[0] != 0xF0:
+                                try:
+                                    owc(raw)
+                                except Exception:
+                                    pass
+                                n_wc = self.stats.get("ctl_wine", 0) + 1
+                                self.stats["ctl_wine"] = n_wc
+                                if n_wc <= 12 or n_wc % 500 == 0:
+                                    print(
+                                        f"[patchbay] ctl Wine→LED #{n_wc} "
+                                        f"hex={raw[:6].hex()}",
+                                        flush=True,
+                                    )
                             try:
                                 self._forward_raw_to_kernel_control(dest, raw)
                             except Exception as e:
@@ -844,11 +1020,18 @@ class _SeqClient:
                             pass
 
                     if kind == "sysex":
-                        print(
-                            f"[patchbay] SYSEX {port_name} len={len(raw)} "
-                            f"{raw[:24].hex()}…",
-                            flush=True,
-                        )
+                        # Browser list (0524) floods ~14 tiles/click — don't stall
+                        # the input pump printing every frame.
+                        cmd_h = raw[4:6].hex() if len(raw) >= 6 else ""
+                        self.stats["sysex_by_cmd"] = self.stats.get("sysex_by_cmd", 0)
+                        n_sx = self.stats["sysex"]
+                        spammy = cmd_h in ("0524", "050a", "0505", "0509")
+                        if (not spammy) or n_sx <= 8 or n_sx % 40 == 0:
+                            print(
+                                f"[patchbay] SYSEX {port_name} len={len(raw)} "
+                                f"cmd={cmd_h or '-'} {raw[:20].hex()}…",
+                                flush=True,
+                            )
                     elif self.stats["events"] <= 20 or self.stats["events"] % 200 == 0:
                         print(
                             f"[patchbay] {self.client_name} in #{self.stats['events']} "
@@ -888,11 +1071,15 @@ class AlsaPatchbay:
         self.gfx_ports: dict[str, int] = {}
         self.on_midi: Callable[[str, bytes], None] | None = None
         self.on_event: Callable[[dict], None] | None = None
+        self.on_control_midi: Callable[[bytes], None] | None = None
+        # Wine → Control (LEDs/meters): used to detect software browser focus
+        self.on_wine_control: Callable[[bytes], None] | None = None
         self.stats = self._bridge.stats  # primary stats (merged view below)
 
     def open(self) -> None:
         self._bridge.on_midi = self._dispatch_midi
         self._bridge.on_event = self._dispatch_event
+        self._bridge.on_control_midi = self._dispatch_control
         self._bridge.open(DEFAULT_PORTS)
         self.client_id = self._bridge.client_id
         self.ports = dict(self._bridge.ports)
@@ -906,6 +1093,9 @@ class AlsaPatchbay:
             self._gfx = _SeqClient(FACADE_CLIENT_NAME)
             self._gfx.on_midi = self._dispatch_midi
             self._gfx.on_event = self._dispatch_event
+            self._gfx.on_control_midi = self._dispatch_control
+            # Forward Wine→Control LED stream to host (browser-focus blink detect)
+            self._gfx.on_wine_control = self._dispatch_wine_control
             self._gfx.open(specs)
             self.gfx_client_id = self._gfx.client_id
             self.gfx_ports = dict(self._gfx.ports)
@@ -923,10 +1113,28 @@ class AlsaPatchbay:
             )
 
     def close(self) -> None:
-        self._bridge.close()
+        # Drop host callbacks first so pumps exit without touching CSV/LCD
+        self.on_midi = None
+        self.on_event = None
+        self.on_control_midi = None
+        self.on_wine_control = None
         if self._gfx:
-            self._gfx.close()
+            self._gfx.on_midi = None
+            self._gfx.on_event = None
+            self._gfx.on_control_midi = None
+            self._gfx.on_wine_control = None
+            try:
+                self._gfx.close()
+            except Exception:
+                pass
             self._gfx = None
+        try:
+            self._bridge.on_midi = None
+            self._bridge.on_event = None
+            self._bridge.on_control_midi = None
+            self._bridge.close()
+        except Exception:
+            pass
 
     def start_input_watch(self) -> None:
         self._bridge.start_input_watch()
@@ -945,6 +1153,37 @@ class AlsaPatchbay:
     def _dispatch_event(self, row: dict) -> None:
         if self.on_event:
             self.on_event(row)
+
+    def _dispatch_control(self, raw: bytes) -> None:
+        if self.on_control_midi:
+            self.on_control_midi(raw)
+
+    def _dispatch_wine_control(self, raw: bytes) -> None:
+        if self.on_wine_control:
+            self.on_wine_control(raw)
+
+    def emit_control_to_wine(self, raw: bytes) -> bool:
+        """Inject short MIDI as if from NV Control hardware → Wine/VDJ.
+
+        Used to force Library View (browse encoder pulse) when the user focuses
+        the software browser with the mouse (definition only paints list after SEL).
+        """
+        if not self._gfx or not raw:
+            return False
+        port = self.gfx_ports.get("NV Control")
+        if port is None:
+            # factory name modes
+            for k, v in self.gfx_ports.items():
+                if "control" in k.lower() or "1005" in k.lower():
+                    port = v
+                    break
+        if port is None:
+            return False
+        try:
+            return bool(self._gfx._emit_raw_to_subscribers(int(port), raw))
+        except Exception as e:
+            print(f"[patchbay] emit_control_to_wine err: {e}", flush=True)
+            return False
 
     def _merged_stats(self) -> dict:
         s = dict(self._bridge.stats)
@@ -965,6 +1204,7 @@ class AlsaPatchbay:
         return (
             f"patchbay: {self.client_name} ({self.client_id}) [{ports}]{gfx} "
             f"in_events={s['events']} sysex={s['sysex']} id_req={s.get('id_req', 0)} "
-            f"id_reply={s.get('id_reply', 0)} cc={s['cc']} note={s['note']}"
+            f"id_reply={s.get('id_reply', 0)} cc={s['cc']} note={s['note']} "
+            f"ctl_hw={s.get('ctl_hw', 0)}/{s.get('ctl_hw_ok', 0)}"
         )
 

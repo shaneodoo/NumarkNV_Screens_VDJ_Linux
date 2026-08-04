@@ -1,0 +1,2316 @@
+#!/usr/bin/env python3
+"""
+nv-screens hybrid host for VirtualDJ under Wine + Numark NV dual LCDs.
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# Allow `import nv_screens.*` without install
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from nv_screens.alsa_patchbay import AlsaPatchbay, RouteTable, ascii_graph  # noqa: E402
+from nv_screens.csv_log import CsvTrafficLog  # noqa: E402
+from nv_screens.usb_midi_bulk import (
+    PID_AUDIO,
+    PID_GRAPHICS,
+    NvBulkPainter,
+    load_bulk_records,
+    load_hex_sysex,
+    load_tsv_sysex,
+    midi_to_usb_midi,
+    sysex_to_usb_midi,
+)  # noqa: E402
+from nv_screens.usb_midi_decode import PRODUCT_NAMES  # noqa: E402
+
+# Prefer the long Windows capture (paint-rich); fall back to short bulk-out.
+_BULK_CANDIDATES = (
+    ROOT / "data/wake/bulk-out.bin",
+)
+BULK_BIN = next((p for p in _BULK_CANDIDATES if p.is_file()), _BULK_CANDIDATES[-1])
+# Short complete open+paint session — better for one-shot LCD wake than a
+# truncated prefix of bulk-long (first paint is at URB ~1474 / ~4998).
+WAKE_BULK_BIN = ROOT / "data/wake/bulk-out.bin"
+# Clean FULL wake for mass use: WinUSBNCap VDJ_start_stop_sequence.pcapng only
+# (empty Controllers: open + FX chrome + default empty titles — NO 0509 tracks).
+# NOT NV_Capture_long_one / bulk-long (those had session track paint).
+WAKE_FULL_BIN = ROOT / "data/wake/empty-deck-bulk.bin"
+CLOSE_BULK_BIN = ROOT / "data/wake/close-bulk.bin"
+# Open-only (0506/08/30) — incomplete UI, emergency fallback
+WAKE_OPEN_ONLY_BIN = ROOT / "data/wake/empty-deck-clean-bulk.bin"
+WAKE_HYBRID_BIN = ROOT / "data/wake/wake-open-plus-empty.bin"
+EMPTY_DECK_BULK = WAKE_FULL_BIN
+INIT1 = ROOT / "captures/extracted-v2/init-cycle-1.tsv"
+INIT2 = ROOT / "captures/extracted-v2/init-cycle-2.tsv"
+HEX_V2 = ROOT / "captures/extracted-v2/all-sysex-hex.txt"
+HEX_V1 = ROOT / "captures/extracted/audio-sysex-hex.txt"
+
+# bulk-long first 0509: Audio/Left ~1474, Graphics/Right ~4998. Truncating
+# earlier mid-message desyncs firmware → black LCDs.
+_MIN_WAKE_URBS_LONG = 5200
+
+# Capture UI that still *looks* like the old WinBoat session (track art/title
+# "After Burn", tempo, waveforms). These are mostly bitmap tiles (0507/0524/0509),
+# not plain-text 0531 — so skipping only 0531/0509 still left After Burn on screen.
+_CAPTURE_CONTENT_CMDS = frozenset({
+    "0507",  # deck chrome tiles (include track title pixels)
+    "0509",  # paint
+    "0524",  # waveform / UI blocks
+    "0531",  # title metadata
+    "0521",  # text lines
+    "050a",  # browser
+    "0504",  # short status text
+    "0505",  # tempo / transport status
+})
+# Cold open / blank: session open + splash only. No 0501/0522/etc. (those still
+# draw leftover deck chrome). Title/artist after VDJ is up is usually live 0521.
+_OPEN_ONLY_CMDS = frozenset({"0506", "0508", "0530"})
+
+
+def bulk_open_cut(records: list[tuple[int, int, bytes]]) -> int:
+    """Index of last URB of dual-product open (0506/0508/0530 both done)."""
+    stream: dict[int, bytearray] = {}
+    open_cmds: dict[int, set[str]] = {}
+    open_done: dict[int, bool] = {}
+    cut = min(80, max(0, len(records) - 1))
+    for i, (pid, _ep, pl) in enumerate(records):
+        st = stream.setdefault(pid, bytearray())
+        open_cmds.setdefault(pid, set())
+        open_done.setdefault(pid, False)
+        for j in range(0, len(pl), 4):
+            if j + 4 > len(pl):
+                break
+            cin = pl[j] & 0xF
+            d = pl[j + 1 : j + 4]
+            if cin == 4:
+                st += d
+            elif cin == 5:
+                st += d[:1]
+            elif cin == 6:
+                st += d[:2]
+            elif cin == 7:
+                st += d[:3]
+            else:
+                continue
+            while True:
+                try:
+                    s = st.index(0xF0)
+                    e = st.index(0xF7, s)
+                except ValueError:
+                    if st and 0xF0 not in st:
+                        st.clear()
+                    elif st and st[0] != 0xF0:
+                        try:
+                            del st[: st.index(0xF0)]
+                        except ValueError:
+                            st.clear()
+                    break
+                msg = bytes(st[s : e + 1])
+                del st[: e + 1]
+                cmd = msg[4:6].hex() if len(msg) >= 6 else ""
+                if cmd in ("0506", "0508", "0530"):
+                    open_cmds[pid].add(cmd)
+                    if {"0506", "0508", "0530"} <= open_cmds[pid]:
+                        open_done[pid] = True
+                    if all(open_done.get(p) for p in (PID_AUDIO, PID_GRAPHICS)):
+                        return i
+    return cut
+
+
+def bulk_wake_prefix(
+    records: list[tuple[int, int, bytes]],
+    mode: str = "chrome",
+) -> list[tuple[int, int, bytes]]:
+    """Raw URB slice for open/full modes (chrome uses filtered actions instead)."""
+    mode = (mode or "chrome").strip().lower()
+    if not records:
+        return []
+    if mode in ("full", "all", "session", "chrome", "ui", "default"):
+        # chrome keeps full corpus; wake player filters title/paint SysEx
+        return list(records)
+    if mode in ("open", "init", "minimal"):
+        return records[: bulk_open_cut(records) + 1]
+    return list(records)
+
+
+def _first_open_cycle_actions(
+    records: list[tuple[int, int, bytes]],
+) -> list[tuple[str, int, bytes]]:
+    """One open cycle per product: CC + 0506/0508/0530 only (no second reopen)."""
+    actions = bulk_wake_actions(
+        records, keep_cmds=_OPEN_ONLY_CMDS, include_cc=True
+    )
+    # Keep CC + first 0506/0508/0530 per pid only
+    seen: dict[int, set[str]] = {}
+    out: list[tuple[str, int, bytes]] = []
+    for kind, pid, payload in actions:
+        if kind != "sysex":
+            out.append((kind, pid, payload))
+            continue
+        cmd = payload[4:6].hex() if len(payload) >= 6 else ""
+        got = seen.setdefault(pid, set())
+        if cmd in got:
+            continue
+        if cmd in _OPEN_ONLY_CMDS:
+            got.add(cmd)
+            out.append((kind, pid, payload))
+        if all(
+            _OPEN_ONLY_CMDS <= seen.get(p, set())
+            for p in (PID_AUDIO, PID_GRAPHICS)
+        ):
+            # Still allow remaining CC raw if any trailing; stop further sysex
+            # by marking both complete — drop later reopen cycles
+            pass
+    # Drop sysex after both products have full open set
+    final: list[tuple[str, int, bytes]] = []
+    done = {PID_AUDIO: False, PID_GRAPHICS: False}
+    for kind, pid, payload in out:
+        if kind == "sysex":
+            if done.get(pid):
+                continue
+            final.append((kind, pid, payload))
+            cmd = payload[4:6].hex() if len(payload) >= 6 else ""
+            if cmd == "0530":
+                done[pid] = True
+        else:
+            # CC only before/during open, not after both done
+            if not all(done.values()):
+                final.append((kind, pid, payload))
+    return final
+
+
+def bulk_wake_actions(
+    records: list[tuple[int, int, bytes]],
+    *,
+    skip_cmds: frozenset[str] | None = None,
+    keep_cmds: frozenset[str] | None = None,
+    include_cc: bool = True,
+) -> list[tuple[str, int, bytes]]:
+    """Expand capture URBs into ordered wake/blank actions.
+
+    keep_cmds: if set, only those SysEx cmds (plus optional CC) — used for
+    clean open/splash and shutdown (no After Burn tiles).
+    skip_cmds: drop these cmds (chrome mode keeps structure, drops deck art).
+    """
+    if skip_cmds is None:
+        skip_cmds = _CAPTURE_CONTENT_CMDS
+    actions: list[tuple[str, int, bytes]] = []
+    stream: dict[int, bytearray] = {}
+
+    for pid, _ep, pl in records:
+        if not pl:
+            continue
+        # Fast path: pure short-MIDI URB (CC etc.)
+        if len(pl) == 4 and (pl[0] & 0xF) not in (4, 5, 6, 7):
+            if include_cc:
+                actions.append(("raw", pid, pl))
+            continue
+
+        st = stream.setdefault(pid, bytearray())
+        raw_cells = bytearray()
+        for j in range(0, len(pl), 4):
+            if j + 4 > len(pl):
+                break
+            cell = pl[j : j + 4]
+            cin = cell[0] & 0xF
+            d = cell[1:4]
+            if cin not in (4, 5, 6, 7):
+                if include_cc:
+                    if raw_cells:
+                        actions.append(("raw", pid, bytes(raw_cells)))
+                        raw_cells.clear()
+                    actions.append(("raw", pid, bytes(cell)))
+                continue
+            if cin == 4:
+                st += d
+            elif cin == 5:
+                st += d[:1]
+            elif cin == 6:
+                st += d[:2]
+            elif cin == 7:
+                st += d[:3]
+            while True:
+                try:
+                    s = st.index(0xF0)
+                    e = st.index(0xF7, s)
+                except ValueError:
+                    if st and 0xF0 not in st:
+                        st.clear()
+                    elif st and st[0] != 0xF0:
+                        try:
+                            del st[: st.index(0xF0)]
+                        except ValueError:
+                            st.clear()
+                    break
+                msg = bytes(st[s : e + 1])
+                del st[: e + 1]
+                cmd = msg[4:6].hex() if len(msg) >= 6 else ""
+                if keep_cmds is not None:
+                    if cmd not in keep_cmds:
+                        continue
+                elif cmd in skip_cmds:
+                    continue
+                actions.append(("sysex", pid, msg))
+        if raw_cells and include_cc:
+            actions.append(("raw", pid, bytes(raw_cells)))
+
+    return actions
+
+VDJ_NAME_HINTS = (
+    "virtualdj",
+    "virtualdj8",
+    "virtualdj.exe",
+    "vdj",
+)
+
+
+def vdj_running() -> bool:
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmd = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
+                    "utf-8", "replace"
+                ).lower()
+            except (OSError, PermissionError):
+                continue
+            if not cmd.strip():
+                continue
+            if "nv_screens" in cmd or "nv-screens" in cmd:
+                continue
+            for hint in VDJ_NAME_HINTS:
+                if hint in cmd:
+                    return True
+            if "virtualdj" in cmd or "virtual dj" in cmd:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def wait_for_vdj(poll_s: float = 0.5, timeout_s: float = 0.0) -> bool:
+    print("[nv] waiting for VirtualDJ… (Ctrl+C to quit)", flush=True)
+    t0 = time.time()
+    while True:
+        if vdj_running():
+            print("[nv] VirtualDJ detected", flush=True)
+            return True
+        if timeout_s > 0 and (time.time() - t0) >= timeout_s:
+            print("[nv] wait timeout — starting paint anyway", flush=True)
+            return False
+        time.sleep(poll_s)
+
+
+# Short chrome/status SysEx: must not sit behind multi-kB waveform tiles or
+# FX circular sliders / button tiles (0507) and status (0505) feel dead.
+_PRIORITY_SYSEX_CMDS = frozenset({
+    "0505",  # status (pitch/play)
+    "0504",  # extended status
+    "0507",  # UI strips (FX arcs / chrome)
+    "0521",  # FX/label tiles
+    "0524",  # browser / list row tiles
+    "0520",  # short clear
+    "0522",
+    "0523",
+    "050a",  # short blocks (meters/text)
+    "0501",
+    "0502",
+    "0506",
+    "0508",
+})
+
+# Non-browser chrome that can still coalesce by strip key
+_COALESCE_SYSEX_CMDS = frozenset({
+    "050a",
+    "0523",
+    "0522",
+    "0521",
+    "0507",
+})
+
+# Browser list: 7 rows (strips 0..6).
+#
+# Measured: Right (CC77) gets clean full 0..6 frames; Left (CC3) is mostly
+# strip-0 spam + partials (deck play / 0509 contention). Aggressive multi-step
+# and "guess reverse" scroll-down on strip-0 made Left glitchy.
+#
+# Policy:
+#   - full 0..6 → replace cache (authoritative)
+#   - strip-0 matches cache[1] → one-step scroll up (confident)
+#   - other strip-0 → wait briefly for a full frame; only then one-step reverse
+#   - min interval between simulated scrolls (debounce CC bursts)
+_BROWSER_STRIPS = frozenset(range(7))
+_BROWSER_INTER_STRIP_S = 0.040
+_BROWSER_ABORT_S = 0.200
+_BROWSER_STRIP0_DEFER_S = 0.028  # wait for full frame before reverse-guess
+_BROWSER_SCROLL_MIN_S = 0.024  # min time between strip-0 scroll paints
+_BROWSER_SIG_SLICE = slice(12, 36)
+_BROWSE_CC_LEFT = 3
+_BROWSE_CC_RIGHT = 77
+
+
+class BrowserFrameAssembler:
+    """7-row browser cache: full-frame replace + careful strip-0 scroll."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._bufs: dict[str, dict[int, tuple]] = {}
+        self._last_t: dict[str, float] = {}
+        self._cache: dict[str, dict[int, tuple]] = {}
+        self._have_full: dict[str, bool] = {}
+        self._last_scroll_t: dict[str, float] = {}
+        self.frames_ok = 0
+        self.scroll_steps = 0
+        self.partial_dropped = 0
+        self.frames_skipped = 0
+
+    @staticmethod
+    def _sig(bulk: bytes) -> bytes:
+        if len(bulk) < _BROWSER_SIG_SLICE.stop:
+            return bulk[12:] if len(bulk) > 12 else bulk
+        return bulk[_BROWSER_SIG_SLICE]
+
+    def _shift_up(self, cache: dict[int, tuple]) -> None:
+        """Rows move up one (library scroll down)."""
+        old = [cache[i] for i in range(7)]
+        for i in range(6):
+            cache[i] = old[i + 1]
+        cache[6] = old[6]
+
+    def _shift_down(self, cache: dict[int, tuple], bulk: bytes, pids) -> None:
+        """Rows move down one (library scroll up); new track at top."""
+        old = [cache[i] for i in range(7)]
+        for i in range(6, 0, -1):
+            cache[i] = old[i - 1]
+        cache[0] = (bulk, pids)
+
+    def _can_scroll(self, side: str, now: float) -> bool:
+        last = self._last_scroll_t.get(side, 0.0)
+        return (now - last) >= _BROWSER_SCROLL_MIN_S
+
+    def _apply_strip0_scroll(
+        self,
+        side: str,
+        bulk: bytes,
+        pids,
+        *,
+        allow_reverse: bool,
+        now: float | None = None,
+    ) -> list | None:
+        """Strip-0 scroll. Only auto reverse when allow_reverse (after quiet)."""
+        now = now if now is not None else time.perf_counter()
+        cache = self._cache.get(side) or {}
+        if set(cache.keys()) < _BROWSER_STRIPS:
+            self._cache.setdefault(side, {})[0] = (bulk, pids)
+            return None
+        newsig = self._sig(bulk)
+        if newsig == self._sig(cache[0][0]):
+            return None  # duplicate / highlight spam
+        if not self._can_scroll(side, now):
+            # Still remember latest strip0 for later quiet resolve
+            return None
+
+        # Confident: new top == previous row 1 → exactly one step down the list
+        if newsig == self._sig(cache[1][0]):
+            self._shift_up(cache)
+            cache[0] = (bulk, pids)
+            self._last_scroll_t[side] = now
+            self.scroll_steps += 1
+            return [cache[i] for i in range(7)]
+
+        # Do not multi-step (k>1) — Left strip bitmaps collide and overscroll.
+
+        if not allow_reverse:
+            return None  # wait for full 0..6 or quiet reverse
+
+        # Quiet strip-0 that matches nothing known → one reverse step
+        self._shift_down(cache, bulk, pids)
+        self._last_scroll_t[side] = now
+        self.scroll_steps += 1
+        return [cache[i] for i in range(7)]
+
+    def _commit_full(self, side: str, buf: dict[int, tuple]) -> list | None:
+        if set(buf.keys()) < _BROWSER_STRIPS:
+            return None
+        cache = self._cache.setdefault(side, {})
+        cache.clear()
+        cache.update(buf)
+        self._have_full[side] = True
+        self.frames_ok += 1
+        return [cache[i] for i in range(7)]
+
+    def push(self, side: str, strip: int, bulk: bytes, pids) -> list[tuple[str, list]]:
+        frames: list[tuple[str, list]] = []
+        if strip < 0 or strip > 6:
+            return []
+        with self._lock:
+            now = time.perf_counter()
+            buf = self._bufs.setdefault(side, {})
+            last = self._last_t.get(side)
+            have = self._have_full.get(side) and set(
+                self._cache.get(side, {})
+            ) >= _BROWSER_STRIPS
+
+            if buf and last is not None and (now - last) >= _BROWSER_ABORT_S:
+                fr = self._resolve_burst(side, buf, now=now)
+                if fr:
+                    frames.append((side, fr))
+                buf.clear()
+
+            if buf and max(buf.keys(), default=-1) > 0 and strip == 0:
+                fr = self._resolve_burst(side, buf, now=now)
+                if fr:
+                    frames.append((side, fr))
+                buf.clear()
+            elif buf and strip < max(buf.keys(), default=-1) and strip != 0:
+                fr = self._resolve_burst(side, buf, now=now)
+                if fr:
+                    frames.append((side, fr))
+                buf.clear()
+
+            # strip-0: only immediate paint when match cache[1] (confident)
+            if strip == 0 and have and max(buf.keys(), default=-1) <= 0:
+                fr = self._apply_strip0_scroll(
+                    side, bulk, pids, allow_reverse=False, now=now
+                )
+                if fr:
+                    frames.append((side, fr))
+                buf.clear()
+                buf[0] = (bulk, pids)
+                self._last_t[side] = now
+                return frames
+
+            buf[strip] = (bulk, pids)
+            self._last_t[side] = now
+
+            fr = self._commit_full(side, buf)
+            if fr is not None:
+                frames.append((side, fr))
+                buf.clear()
+        return frames
+
+    def _resolve_burst(
+        self, side: str, buf: dict[int, tuple], *, now: float | None = None
+    ) -> list | None:
+        full = self._commit_full(side, buf)
+        if full is not None:
+            return full
+        if set(buf.keys()) == {0}:
+            bulk, pids = buf[0]
+            return self._apply_strip0_scroll(
+                side, bulk, pids, allow_reverse=True, now=now
+            )
+        self.partial_dropped += 1
+        return None
+
+    def poll_timeouts(self, max_age: float = 0.015) -> list[tuple[str, list]]:
+        frames: list[tuple[str, list]] = []
+        with self._lock:
+            now = time.perf_counter()
+            for side in list(self._bufs.keys()):
+                buf = self._bufs.get(side) or {}
+                if not buf:
+                    continue
+                last = self._last_t.get(side, now)
+                quiet = now - last
+                keys = set(buf.keys())
+                if keys >= _BROWSER_STRIPS and quiet >= _BROWSER_INTER_STRIP_S:
+                    fr = self._commit_full(side, buf)
+                    if fr:
+                        frames.append((side, fr))
+                    buf.clear()
+                elif keys == {0} and quiet >= _BROWSER_STRIP0_DEFER_S:
+                    bulk, pids = buf[0]
+                    # After quiet: allow reverse or confident up
+                    fr = self._apply_strip0_scroll(
+                        side, bulk, pids, allow_reverse=True, now=now
+                    )
+                    if fr:
+                        frames.append((side, fr))
+                    buf.clear()
+                elif quiet >= _BROWSER_ABORT_S:
+                    fr = self._resolve_burst(side, buf, now=now)
+                    if fr:
+                        frames.append((side, fr))
+                    buf.clear()
+        return frames
+
+    def summary(self) -> str:
+        return (
+            f"browser_full={self.frames_ok} "
+            f"scroll_steps={self.scroll_steps} "
+            f"partial_drop={self.partial_dropped} "
+            f"skip_mirror={self.frames_skipped}"
+        )
+
+
+class DropOldQueue:
+    """Thread-safe live paint queue of (bulk_bytes, pids|None) or browser batches.
+
+    *live=True*: FIFO with priority — short chrome/status ahead of large 0509.
+    Browser frames are atomic batches (all 7 strips) tagged by side.
+    *live=False*: keep-newest burst (capture hybrid).
+    """
+
+    def __init__(self, maxlen: int = 64, *, live: bool = True) -> None:
+        # priority entries: (item, key|None)
+        # item may be (bulk, pids) or ("browser_frame", side, [(bulk,pids),...])
+        self._q: deque = deque()  # normal (large paint) items
+        self._pq: deque = deque()  # priority (item, key|None)
+        self._maxlen = maxlen
+        self._cv = threading.Condition()
+        self.dropped = 0
+        self.coalesced = 0
+        self.live = live
+
+    def _total(self) -> int:
+        return len(self._q) + len(self._pq)
+
+    def put(
+        self,
+        item,
+        *,
+        priority: bool = False,
+        coalesce_key=None,
+        protect: bool = False,
+    ) -> None:
+        """Enqueue paint. protect=True: never drop this item when the queue is full
+        (waveform 0509 tiles after LOAD)."""
+        with self._cv:
+            if priority and self.live and coalesce_key is not None:
+                for i, entry in enumerate(self._pq):
+                    k = entry[1] if len(entry) > 1 else None
+                    if k == coalesce_key:
+                        self._pq[i] = (item, coalesce_key, protect)
+                        self.coalesced += 1
+                        self._cv.notify()
+                        return
+            if self._maxlen is not None and self._total() >= self._maxlen:
+                # Drop unprotected non-priority first, then unprotected priority
+                if self._q:
+                    self._q.popleft()
+                    self.dropped += 1
+                else:
+                    dropped_one = False
+                    for i, entry in enumerate(self._pq):
+                        # entry: (item, key, protect?)
+                        prot = entry[2] if len(entry) > 2 else False
+                        if not prot:
+                            del self._pq[i]
+                            self.dropped += 1
+                            dropped_one = True
+                            break
+                    if not dropped_one and not protect:
+                        self._pq.popleft()
+                        self.dropped += 1
+            if priority and self.live:
+                self._pq.append((item, coalesce_key, protect))
+            else:
+                self._q.append(item)
+            self._cv.notify()
+
+    def put_browser_frame(self, side: str, tiles: list) -> None:
+        """Queue an atomic 7-strip browser frame; keep only latest per side."""
+        if not tiles:
+            return
+        item = ("browser_frame", side, tiles)
+        with self._cv:
+            # Drop older pending frames for this side only — keep protected 0509
+            kept = deque()
+            for entry in self._pq:
+                it = entry[0]
+                if (
+                    isinstance(it, tuple)
+                    and len(it) == 3
+                    and it[0] == "browser_frame"
+                    and it[1] == side
+                ):
+                    self.coalesced += 1
+                    continue
+                kept.append(entry)
+            self._pq = kept
+            # Do NOT clear _q of protected path — drop_large_paint handles non-pri
+            self._pq.append((item, ("browser_frame", side), False))
+            self._cv.notify()
+
+    def get(self, timeout: float | None = None):
+        with self._cv:
+            if not self._q and not self._pq:
+                if timeout is None:
+                    self._cv.wait()
+                else:
+                    self._cv.wait(timeout)
+            if not self._q and not self._pq:
+                return None
+            if self.live:
+                if self._pq:
+                    return self._pq.popleft()[0]
+                return self._q.popleft()
+            if self._pq:
+                item = self._pq.pop()[0]
+                self.dropped += len(self._pq) + len(self._q)
+                self._pq.clear()
+                self._q.clear()
+                return item
+            item = self._q.pop()
+            n = len(self._q)
+            if n:
+                self.dropped += n
+                self._q.clear()
+            return item
+
+    def drain(self, max_n: int = 32) -> list:
+        """Drain items. Browser frames expand to individual tiles (ordered)."""
+        with self._cv:
+            out: list = []
+            while self._pq and len(out) < max_n:
+                raw = self._pq.popleft()[0] if self.live else self._pq.pop()[0]
+                if (
+                    isinstance(raw, tuple)
+                    and len(raw) == 3
+                    and raw[0] == "browser_frame"
+                ):
+                    tiles = raw[2]
+                    out.extend(tiles)
+                else:
+                    out.append(raw)
+            while self._q and len(out) < max_n:
+                out.append(self._q.popleft() if self.live else self._q.pop())
+            if not self.live and (self._q or self._pq):
+                self.dropped += len(self._q) + len(self._pq)
+                self._q.clear()
+                self._pq.clear()
+            return out
+
+    def pending(self) -> bool:
+        with self._cv:
+            return bool(self._q or self._pq)
+
+    def drop_large_paint(self) -> int:
+        """Drop non-priority backlog only (never protected 0509 on priority)."""
+        with self._cv:
+            n = len(self._q)
+            if n:
+                self._q.clear()
+                self.dropped += n
+            return n
+
+    def drain_priority(self, max_n: int = 48) -> list:
+        """Drain priority queue (browser + protected deck paint)."""
+        with self._cv:
+            out: list = []
+            while self._pq and len(out) < max_n:
+                raw = self._pq.popleft()[0] if self.live else self._pq.pop()[0]
+                if (
+                    isinstance(raw, tuple)
+                    and len(raw) == 3
+                    and raw[0] == "browser_frame"
+                ):
+                    out.extend(raw[2])
+                else:
+                    out.append(raw)
+            return out
+
+
+def build_init_msgs() -> list[bytes]:
+    msgs: list[bytes] = []
+    for path in (INIT1, INIT2):
+        if not path.is_file():
+            continue
+        for _port, m in load_tsv_sysex(path):
+            if len(m) >= 6 and m[0] == 0xF0 and m[1] == 0x47:
+                msgs.append(m)
+    return msgs
+
+
+def build_clear_msgs() -> list[bytes]:
+    clear_cmds = {"0502", "0506", "0508", "0530"}
+    msgs: list[bytes] = []
+    for path in (INIT1, INIT2):
+        if not path.is_file():
+            continue
+        for _port, m in load_tsv_sysex(path):
+            if len(m) >= 6 and m[0] == 0xF0 and m[1] == 0x47:
+                if m[4:6].hex() in clear_cmds:
+                    msgs.append(m)
+    return msgs
+
+
+def build_paint_corpus() -> tuple[list[bytes], list[bytes]]:
+    paint: list[bytes] = []
+    status: list[bytes] = []
+    # Prefer long-capture assembled SysEx (full session, not short bulk-out)
+    long_tsv = ROOT / "captures/extracted-v2/bulk-long.traffic.sysex.tsv"
+    paths = [
+        long_tsv,
+        HEX_V1,
+        HEX_V2,
+        ROOT / "captures/extracted/all-sysex-hex.txt",
+        ROOT / "captures/extracted-v2/all-sysex-hex.txt",
+    ]
+    for path in paths:
+        if not path.is_file():
+            continue
+        # TSV format: product\tcmd\trole\tid\tdeck\tlen\thex
+        if path.suffix == ".tsv" or path.name.endswith(".sysex.tsv"):
+            for ln in path.read_text().splitlines()[1:]:
+                parts = ln.split("\t")
+                if len(parts) < 7:
+                    continue
+                cmd, hx = parts[1], parts[-1]
+                try:
+                    m = bytes.fromhex(hx)
+                except ValueError:
+                    continue
+                if cmd == "0509":
+                    paint.append(m)
+                elif cmd == "0505":
+                    status.append(m)
+                elif cmd == "0531" and len(m) >= 1000:
+                    paint.append(m)
+        else:
+            if not paint:
+                paint = load_hex_sysex(path, "0509")
+            status.extend(load_hex_sysex(path, "0505"))
+            big = [m for m in load_hex_sysex(path) if len(m) >= 2000]
+            for m in big:
+                if m not in paint:
+                    paint.append(m)
+        if paint and status:
+            break
+    # Cap status to keep loop snappy; keep many paint frames for motion
+    if len(status) > 800:
+        status = status[:: max(1, len(status) // 800)]
+    if len(paint) > 2500:
+        # subsample evenly to keep memory/loop reasonable
+        step = max(1, len(paint) // 2500)
+        paint = paint[::step]
+    if not paint:
+        for path in (INIT1, INIT2):
+            if path.is_file():
+                paint.extend(m for _, m in load_tsv_sysex(path) if len(m) > 1000)
+    return paint, status
+
+
+class NvScreensDaemon:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.stop = threading.Event()
+        products = [PID_GRAPHICS]
+        if not args.graphics_only:
+            products.append(PID_AUDIO)
+        self.painter = NvBulkPainter(
+            products=products,
+            write_timeout_ms=args.write_timeout_ms,
+        )
+        # Live path: deep FIFO so multi-tile display frames aren't discarded
+        live = bool(getattr(self.args, "live_only", False))
+        # Deep FIFO for multi-tile 0509 streams (live=True = popleft, no coalesce)
+        self.pass_q = DropOldQueue(maxlen=1024 if live else 8, live=live)
+        self._live_paint_until = 0.0  # wall time: suppress capture while live F0 47 flows
+        self._browser_until = 0.0  # suppress heavy 0509 while browser list scrolls
+        self._browser_asm = BrowserFrameAssembler()
+        # Which LCD's browser list to prefer when VDJ mirrors both.
+        # Set by: browse knobs (CC3=L, CC77=R) OR mouse focus (0522/0523/0524
+        # arriving on that display port). Mirror-skip only shortly after a knob
+        # turn — otherwise clicking Automix/sidelist never paints the LCD.
+        self._browse_paint_side: str | None = None
+        self._browse_knob_t = 0.0  # perf_counter of last browse-encoder move
+        self._browse_focus_t = 0.0  # VDJ browser chrome (mouse focus) on a display
+        self._browse_side_lock = threading.Lock()
+        # Sticky LCD content mode:
+        #   browser — list + pane title (knob OR VDJ mouse focus OR 0524 list)
+        #   deck    — after LOAD; ignore residual 0524 briefly, then allow mouse focus
+        self._lcd_content_mode: str = "browser"  # "deck" | "browser"
+        self._deck_enter_t = 0.0  # when we last entered deck mode (post-LOAD)
+        # Cache last browser paint per side so mouse focus can re-show list
+        # (VDJ only re-emits 0524 after SEL/browse — mouse alone sends nothing).
+        self._browser_cache: dict[str, dict[str, list]] = {
+            "L": {"strips": [], "chrome": []},
+            "R": {"strips": [], "chrome": []},
+        }
+        self._browser_cache_lock = threading.Lock()
+        self._last_browser_paint_t = 0.0
+        # Software browser focus (mouse): mapping blinks LED_PITCHARROW- when
+        # songs pane focused; host detects blink → injects net-zero browse pulse
+        # so VDJ definition enters Library View and paints the current list.
+        self._led_toggle_times: dict[tuple, list[float]] = {}
+        self._led_last_val: dict = {}
+        self._sw_browser_focus_t = 0.0
+        self._last_browse_inject_t = 0.0
+        self._browse_inject_count = 0
+        self._browser_keepalive_stop = threading.Event()
+        self._lcd_woken = False
+        self._logo_sysex_done = False
+        self._wake_lock = threading.Lock()
+        self.bulk_records: list[tuple[int, int, bytes]] = []
+        self.wake_records: list[tuple[int, int, bytes]] = []
+        self.wake_actions: list[tuple[str, int, bytes]] = []
+        self.open_actions: list[tuple[str, int, bytes]] = []  # splash only (shutdown)
+        self.empty_deck: list[tuple[int, bytes]] = []  # WinBoat full empty UI
+        self.close_seq: list[tuple[int, bytes]] = []  # WinBoat File→Exit tail
+        self.wake_mode: str = "chrome"
+        self.init_msgs: list[bytes] = []
+        self.paint_msgs: list[bytes] = []
+        self.status_msgs: list[bytes] = []
+        self.clear_msgs: list[bytes] = []
+        self._pt_thread: threading.Thread | None = None
+        self.csv = None  # CsvTrafficLog | None
+        self.patchbay = None  # AlsaPatchbay | None
+        self._vdj_csv = None  # CsvTrafficLog | None
+        self._csv_every = max(1, int(args.csv_every))
+        self._csv_n = 0
+        self._vdj_monitor: threading.Thread | None = None
+        self._vdj_running = False
+        self._vdj_seen_once = False  # only auto-exit after VDJ has actually run
+        self._vdj_gone_since: float | None = None
+        self._last_activity = time.time()
+        self._exit_reason = ""
+
+        # USB gone (ENODEV) → request clean shutdown
+        def _fatal_usb(err: Exception) -> None:
+            if self.stop.is_set():
+                return
+            self._exit_reason = f"usb_gone: {err}"
+            print(f"[nv] fatal USB — shutting down ({err})", flush=True)
+            self.stop.set()
+
+        self.painter.on_fatal_usb = _fatal_usb
+
+    def mark_activity(self) -> None:
+        self._last_activity = time.time()
+
+    def setup(self) -> None:
+        import os
+
+        live_only = bool(getattr(self.args, "live_only", False))
+        t_setup = time.perf_counter()
+
+        # live-only never replays bulk-long paint — skip loading 100k+ URBs
+        if not live_only and BULK_BIN.is_file():
+            self.bulk_records = load_bulk_records(BULK_BIN)
+            print(
+                f"[nv] bulk corpus: {len(self.bulk_records)} URBs from {BULK_BIN.name}",
+                flush=True,
+            )
+        elif live_only:
+            self.bulk_records = []
+            print("[nv] live-only: skip bulk-long corpus load (fast start)", flush=True)
+
+        # Default open = splash only. chrome still strips tiles but can leave
+        # residual fields; full = entire capture session (debug only).
+        self.wake_mode = (
+            getattr(self.args, "wake_mode", None)
+            or os.environ.get("NV_WAKE_MODE")
+            or "open"
+        )
+        raw_wake: list[tuple[int, int, bytes]] = []
+        # Prefer tiny open bulk for fallback actions; empty-deck wake is separate
+        if WAKE_BULK_BIN.is_file() and not live_only:
+            raw_wake = load_bulk_records(WAKE_BULK_BIN)
+            src_name = WAKE_BULK_BIN.name
+        elif self.bulk_records:
+            raw_wake = self.bulk_records[: max(_MIN_WAKE_URBS_LONG, 5200)]
+            src_name = f"{BULK_BIN.name}[:{len(raw_wake)}]"
+        else:
+            src_name = "empty-deck-bulk.bin (live)" if WAKE_FULL_BIN.is_file() else "(none)"
+        self.wake_records = bulk_wake_prefix(raw_wake, mode=str(self.wake_mode)) if raw_wake else []
+        if self.wake_records:
+            self.open_actions = _first_open_cycle_actions(self.wake_records)
+
+        # Preferred wake: full empty-deck UI from WinBoat VDJ_start_stop capture
+        # (0506/08/30 + 0501/02/07/24/21… — Controllers chrome, no track 0509).
+        self.empty_deck: list[tuple[int, bytes]] = []
+        self.close_seq: list[tuple[int, bytes]] = []
+        try:
+            from nv_screens.win_lifecycle import empty_deck_sequence, full_close_sequence
+
+            self.empty_deck = empty_deck_sequence()
+            self.close_seq = full_close_sequence()
+        except Exception as e:
+            print(f"[nv] win empty-deck load note: {e}", flush=True)
+
+        if self.wake_mode in ("chrome", "ui"):
+            self.wake_actions = bulk_wake_actions(
+                self.wake_records,
+                skip_cmds=_CAPTURE_CONTENT_CMDS,
+                include_cc=True,
+            )
+        elif self.wake_mode in (
+            "open",
+            "init",
+            "minimal",
+            "splash",
+            "empty",
+            "default",
+            "",
+        ):
+            # Prefer WinBoat empty-deck list; fall back to open-only actions
+            self.wake_actions = list(self.open_actions)
+        else:
+            self.wake_actions = []  # full uses raw URBs
+        print(
+            f"[nv] wake mode={self.wake_mode} "
+            f"wake_full={'yes' if WAKE_FULL_BIN.is_file() else 'no'} "
+            f"close_bulk={'yes' if CLOSE_BULK_BIN.is_file() else 'no'} "
+            f"open_fallback={len(self.open_actions)} bulk_src={src_name}",
+            flush=True,
+        )
+        if live_only:
+            # Wake uses empty-deck-bulk.bin URBs; no amidi init/paint reel needed
+            self.init_msgs = []
+            self.clear_msgs = []
+            self.paint_msgs, self.status_msgs = [], []
+            print(
+                f"[nv] live-only: skip init/paint corpus "
+                f"(setup {(time.perf_counter() - t_setup) * 1000:.0f}ms)",
+                flush=True,
+            )
+        else:
+            self.init_msgs = build_init_msgs()
+            self.clear_msgs = build_clear_msgs()
+            self.paint_msgs, self.status_msgs = build_paint_corpus()
+            print(
+                f"[nv] init_msgs={len(self.init_msgs)} "
+                f"clear_msgs={len(self.clear_msgs)} "
+                f"paint={len(self.paint_msgs)} status={len(self.status_msgs)} "
+                f"(setup {(time.perf_counter() - t_setup) * 1000:.0f}ms)",
+                flush=True,
+            )
+        if self.args.csv_log:
+            self.csv = CsvTrafficLog(Path(self.args.csv_log), max_hex=self.args.csv_max_hex)
+            print(f"[nv] CSV log → {self.args.csv_log} (every {self._csv_every} URB)", flush=True)
+        if self.args.patchbay:
+            try:
+                routes = RouteTable()
+                if self.args.routes and Path(self.args.routes).is_file():
+                    routes = RouteTable.load(Path(self.args.routes))
+                print(ascii_graph(routes, live={
+                    "wine_vdj": "(Wine)",
+                    "capture": "(bulk corpus)",
+                    "inject": "(inject_in)",
+                    "graphics_bulk": "(libusb LCD)",
+                    "csv": "(csv log)" if self.csv else "(off)",
+                    "monitor": "(monitor_out)",
+                }))
+                # Virtual NV Graphics facade: Wine/VDJ *sees* Graphics IN so it
+                # will open an OUT path; real USB paint stays libusb-only.
+                vgfx = not getattr(self.args, "no_virtual_graphics", False)
+                dports = not getattr(self.args, "no_display_ports", False)
+                self.patchbay = AlsaPatchbay(
+                    virtual_graphics=vgfx,
+                    display_ports=dports,
+                )
+                self.patchbay.open()
+                vdj_csv_path = Path(self.args.vdj_csv or (ROOT / "captures/vdj-from-wine.csv"))
+                self._vdj_csv = CsvTrafficLog(vdj_csv_path, max_hex=256)
+
+                def _on_event(row: dict) -> None:
+                    row.setdefault("direction", "wine_to_nv")
+                    try:
+                        self._vdj_csv.write(row)
+                    except Exception:
+                        pass
+
+                # allowlist and lightweight metadata throttling
+                allow_set = {s.strip().lower() for s in (self.args.allow_sysex or "").split(",") if s.strip()}
+                metadata_cmds = {"050a", "0505", "0531"}
+                last_sent: dict[str, float] = {}
+                throttle_s = max(0.001, float(getattr(self.args, "metadata_throttle_ms", 150)) / 1000.0)
+
+                def _cache_browser_tile(
+                    side: str, cmd_l: str, bulk: bytes, pids, strip: int | None
+                ) -> None:
+                    """Remember last browser tiles for mouse re-paint."""
+                    with self._browser_cache_lock:
+                        slot = self._browser_cache.setdefault(
+                            side, {"strips": [], "chrome": []}
+                        )
+                        if cmd_l == "0524" and strip is not None:
+                            strips = list(slot.get("strips") or [])
+                            # keep up to 7 latest by strip index
+                            by_i = {
+                                int(s[0]): s
+                                for s in strips
+                                if isinstance(s, tuple) and len(s) >= 3
+                            }
+                            by_i[int(strip)] = (int(strip), bulk, pids)
+                            slot["strips"] = [
+                                by_i[i] for i in sorted(by_i.keys()) if 0 <= i <= 6
+                            ]
+                        elif cmd_l in ("0521", "0522", "0523", "0520"):
+                            chrome = [
+                                c
+                                for c in (slot.get("chrome") or [])
+                                if not (isinstance(c, tuple) and c[0] == cmd_l)
+                            ]
+                            chrome.append((cmd_l, bulk, pids))
+                            slot["chrome"] = chrome[-8:]
+
+                def _repaint_browser_cache(side: str | None = None) -> int:
+                    """Queue cached browser chrome+strips. Returns tile count."""
+                    sides = [side] if side in ("L", "R") else ["L", "R"]
+                    n = 0
+                    with self._browser_cache_lock:
+                        for s in sides:
+                            slot = self._browser_cache.get(s) or {}
+                            for item in slot.get("chrome") or []:
+                                if isinstance(item, tuple) and len(item) >= 3:
+                                    _, bulk, pids = item[0], item[1], item[2]
+                                    self.pass_q.put(
+                                        (bulk, pids), priority=True, protect=True
+                                    )
+                                    n += 1
+                            for item in slot.get("strips") or []:
+                                if isinstance(item, tuple) and len(item) >= 3:
+                                    # (strip, bulk, pids)
+                                    bulk, pids = item[1], item[2]
+                                    self.pass_q.put(
+                                        (bulk, pids), priority=True, protect=True
+                                    )
+                                    n += 1
+                    if n:
+                        self._last_browser_paint_t = time.perf_counter()
+                        self._lcd_content_mode = "browser"
+                        self._browser_until = time.perf_counter() + 0.8
+                        self.mark_activity()
+                    return n
+
+                def _inject_browse_pulse(side: str = "L") -> bool:
+                    """Net-zero relative browse tick so VDJ opens Library View.
+
+                    Official NV behavior: Library View only appears after SEL/browse
+                    or D.VIEW. Mouse focus sends zero display SysEx — so we inject
+                    CC3(+1 then -1) or CC77 to force definition paint of *current*
+                    software selection without net scroll.
+                    """
+                    if not self.patchbay:
+                        return False
+                    now = time.perf_counter()
+                    if (now - self._last_browse_inject_t) < 0.45:
+                        return False
+                    # Skip if hardware knob just moved (already opening browser)
+                    with self._browse_side_lock:
+                        if (now - self._browse_knob_t) < 0.35:
+                            return False
+                    self._last_browse_inject_t = now
+                    self._browse_inject_count += 1
+                    with self._browse_side_lock:
+                        self._browse_paint_side = side
+                        # Do NOT set _browse_knob_t — that would mirror-skip the
+                        # other LCD; this is a soft open, not a real knob turn.
+                    self._lcd_content_mode = "browser"
+                    self._browser_until = now + 0.9
+                    # Immediate re-show of last known list while VDJ re-paints
+                    cached = _repaint_browser_cache(side)
+                    cc = _BROWSE_CC_LEFT if side != "R" else _BROWSE_CC_RIGHT
+                    n = self._browse_inject_count
+
+                    def _do_inject() -> None:
+                        # Off the ALSA pump thread — gap between +1 and -1
+                        ok1 = self.patchbay.emit_control_to_wine(bytes([0xB0, cc, 1]))
+                        time.sleep(0.012)
+                        ok2 = self.patchbay.emit_control_to_wine(bytes([0xB0, cc, 127]))
+                        if n <= 8 or n % 20 == 0:
+                            print(
+                                f"[nv] mouse→library: inject browse CC{cc} "
+                                f"side={side} wine={ok1 and ok2} cache={cached} "
+                                f"#{n}",
+                                flush=True,
+                            )
+
+                    threading.Thread(
+                        target=_do_inject, name="nv-browse-inject", daemon=True
+                    ).start()
+                    return True
+
+                def _on_wine_control(raw: bytes) -> None:
+                    """Detect mapping blink LED = software browser pane focused.
+
+                    Mapper: LED_PITCHARROW- = browser_window 'song' ? blink 200ms : off
+                    Host sees rapid note/CC toggles → inject Library View open.
+                    """
+                    if len(raw) < 3:
+                        return
+                    st = raw[0] & 0xF0
+                    if st not in (0x90, 0x80, 0xB0):
+                        return
+                    d1 = raw[1] & 0x7F
+                    d2 = raw[2] & 0x7F
+                    kind = "cc" if st == 0xB0 else "note"
+                    key = (kind, raw[0] & 0x0F, d1)
+                    now = time.perf_counter()
+                    prev = self._led_last_val
+                    last_v = prev.get(key)
+                    if st in (0x90, 0x80):
+                        cur = 0 if (st == 0x80 or d2 == 0) else 1
+                    else:
+                        # Treat any non-zero as "on" for blink LEDs (0/1 or 0/127)
+                        cur = 1 if d2 > 0 else 0
+                    if last_v is not None and last_v == cur:
+                        return
+                    prev[key] = cur
+                    times = self._led_toggle_times.setdefault(key, [])
+                    times.append(now)
+                    del times[:-48]
+                    cutoff = now - 0.90
+                    while times and times[0] < cutoff:
+                        times.pop(0)
+                    # blink 200ms → ~5 edges/s; need ≥4 edges in 900ms
+                    # (ignore slow pitch/VU chatter)
+                    if len(times) < 4:
+                        return
+                    # Also require average period consistent with blink (<350ms)
+                    if len(times) >= 3:
+                        gaps = [times[i] - times[i - 1] for i in range(1, len(times))]
+                        avg = sum(gaps) / len(gaps)
+                        if avg > 0.40:
+                            return
+                    self._sw_browser_focus_t = now
+                    paint_age = now - self._last_browser_paint_t
+                    if paint_age < 0.40 and self._lcd_content_mode == "browser":
+                        return
+                    side = self._browse_paint_side or "L"
+                    _inject_browse_pulse(side)
+
+                def _browser_keepalive_loop() -> None:
+                    """While software browser focus is hot, refresh Library View.
+
+                    Definition auto-exits library after ~3s without SEL. Keep-alive
+                    inject every 1.8s while mouse/song focus is recent so the LCD
+                    list tracks mouse selection without needing more knobs.
+                    """
+                    while not self.stop.is_set() and not self._browser_keepalive_stop.is_set():
+                        time.sleep(0.35)
+                        now = time.perf_counter()
+                        sw_age = now - self._sw_browser_focus_t
+                        if sw_age > 4.0:
+                            continue
+                        # Don't fight post-LOAD deck paint for the first 0.6s
+                        if (
+                            self._lcd_content_mode == "deck"
+                            and (now - self._deck_enter_t) < 0.6
+                        ):
+                            continue
+                        paint_age = now - self._last_browser_paint_t
+                        if paint_age < 1.5:
+                            continue
+                        side = self._browse_paint_side or "L"
+                        _inject_browse_pulse(side)
+
+                def _on_midi(port: str, raw: bytes) -> None:
+                    """
+                    Wine → facade port → USB-MIDI bulk (correct product per display).
+
+                    Display Left  → force product 15e4:1033 (0x10 0x33)
+                    Display Right → force product 15e4:2033 (0x20 0x33)
+                    Also accept F0 47 display product SysEx from any port (mis-route).
+                    """
+                    if not raw:
+                        return
+                    port_l = (port or "").lower()
+                    is_left = "left" in port_l or (
+                        "audio" in port_l and "midi" not in port_l and "display" not in port_l
+                    )
+                    is_right = "right" in port_l or "graphics" in port_l
+                    is_display = is_left or is_right or "display" in port_l
+
+                    if raw[0] != 0xF0:
+                        return  # never short-MIDI to LCD bulk
+                    if raw[-1:] != b"\xf7" or len(raw) < 6:
+                        return
+
+                    is_numark = len(raw) >= 4 and raw[1] == 0x47
+                    # Catch display paint that arrived on Control/vdj_in
+                    if not is_display:
+                        if not is_numark or len(raw) < 4:
+                            return
+                        # Product bytes: 0x10 0x33 = Audio/Left, 0x20 0x33 = Graphics/Right
+                        prod = raw[2]
+                        if prod == 0x10:
+                            is_left, is_right, is_display = True, False, True
+                        elif prod == 0x20:
+                            is_left, is_right, is_display = False, True, True
+                        else:
+                            return  # Control 0x1005 etc. — not LCD paint
+
+                    cmd = raw[4:6].hex()
+                    if allow_set and not is_numark and cmd not in allow_set:
+                        return
+                    now = time.perf_counter()
+                    if cmd in metadata_cmds and not is_numark:
+                        last = last_sent.get(cmd, 0.0)
+                        if (now - last) < throttle_s:
+                            return
+                        last_sent[cmd] = now
+
+                    # Route by facade PORT when known; product bytes only for mis-routes.
+                    if is_right:
+                        pids = [PID_GRAPHICS]
+                    else:
+                        pids = [PID_AUDIO]
+
+                    bulk = sysex_to_usb_midi(raw)
+                    kind = "sysex_forwarded"
+                    if is_numark and len(raw) > 32:
+                        self._live_paint_until = time.perf_counter() + 2.0
+
+                    cmd_l = (cmd or "").lower()
+                    side = "R" if is_right else "L"
+                    now_pc = time.perf_counter()
+
+                    # Always paint browser list/title VDJ sends (mouse OR knob).
+                    # Always paint protected waveforms. Only skip mirror flood
+                    # on the other LCD for ~350ms after a real knob turn.
+                    with self._browse_side_lock:
+                        knob_age = now_pc - self._browse_knob_t
+                        want = self._browse_paint_side
+
+                    _browser_ui = cmd_l in (
+                        "0524", "0523", "0522", "0521", "0520",
+                    )
+                    _deck_paint = cmd_l in (
+                        "0509", "0531", "0507", "0501", "0502",
+                    ) and len(raw) > 80
+
+                    if _browser_ui:
+                        with self._browse_side_lock:
+                            if (
+                                cmd_l == "0524"
+                                and want is not None
+                                and side != want
+                                and knob_age <= 0.35
+                            ):
+                                self._browser_asm.frames_skipped += 1
+                                return
+                            if want != side:
+                                self._browse_paint_side = side
+                            self._browse_focus_t = now_pc
+                        self._lcd_content_mode = "browser"
+                        self._browser_until = now_pc + 0.55
+                        self._last_browser_paint_t = now_pc
+
+                        if cmd_l == "0524" and len(raw) > 10:
+                            strip = int(raw[10])
+                            _cache_browser_tile(side, cmd_l, bulk, pids, strip)
+                            # IMMEDIATE per-strip paint (mouse + knob).
+                            self.pass_q.put(
+                                (bulk, pids), priority=True, protect=True
+                            )
+                            for fr_side, frame in self._browser_asm.push(
+                                side, strip, bulk, pids
+                            ):
+                                self.pass_q.put_browser_frame(fr_side, frame)
+                        else:
+                            _cache_browser_tile(side, cmd_l, bulk, pids, None)
+                            self.pass_q.put(
+                                (bulk, pids),
+                                priority=True,
+                                protect=True,
+                                coalesce_key=(
+                                    cmd_l,
+                                    side,
+                                    raw[10] if len(raw) > 10 else 0,
+                                    pids[0] if pids else 0,
+                                ),
+                            )
+                        self.mark_activity()
+
+                    elif _deck_paint:
+                        # Don't stomp browser if software browser focus is hot
+                        sw_age = now_pc - self._sw_browser_focus_t
+                        if sw_age < 1.2 and cmd_l == "0509":
+                            # Soft-drop waveform tiles while mouse-browsing
+                            self.mark_activity()
+                        else:
+                            if cmd_l in ("0501", "0502", "0531") and len(raw) > 80:
+                                if self._lcd_content_mode != "deck":
+                                    print(
+                                        f"[nv] deck view (cmd={cmd_l})",
+                                        flush=True,
+                                    )
+                                self._lcd_content_mode = "deck"
+                                self._deck_enter_t = now_pc
+                            self.pass_q.put(
+                                (bulk, pids),
+                                priority=True,
+                                protect=True,
+                            )
+                            self.mark_activity()
+                    else:
+                        pri = bool(cmd_l in _PRIORITY_SYSEX_CMDS)
+                        if is_numark and len(raw) < 700:
+                            pri = True
+                        coalesce_key = None
+                        if cmd_l in _COALESCE_SYSEX_CMDS and len(raw) > 10:
+                            coalesce_key = (
+                                cmd_l,
+                                side,
+                                int(raw[10]),
+                                pids[0] if pids else 0,
+                            )
+                        self.pass_q.put(
+                            (bulk, pids), priority=pri, coalesce_key=coalesce_key
+                        )
+                        self.mark_activity()
+
+                    # Human-readable live stream (tail -f captures/live-bridge.txt)
+                    if self.stop.is_set():
+                        return
+                    try:
+                        live_path = ROOT / "captures/live-bridge.txt"
+                        with live_path.open("a", encoding="utf-8") as lf:
+                            hx = raw.hex()
+                            if len(hx) > 96:
+                                hx = hx[:96] + "…"
+                            side_l = "R" if is_right else "L"
+                            ts = time.time()
+                            lf.write(
+                                f"{time.strftime('%H:%M:%S', time.localtime(ts))}"
+                                f".{int((ts % 1) * 1000):03d} {kind} {side_l} "
+                                f"cmd={cmd or '-'} len={len(raw)} {hx}\n"
+                            )
+                    except Exception:
+                        pass
+
+                    if self._vdj_csv:
+                        try:
+                            meta_text = ""
+                            if raw[0] == 0xF0:
+                                import re
+
+                                s = "".join(chr(x) if 32 <= x < 127 else "." for x in raw)
+                                m = re.search(r"[A-Za-z0-9 \-_.]{4,64}", s)
+                                meta_text = m.group(0) if m else ""
+                            self._vdj_csv.write(
+                                {
+                                    "direction": "wine_to_nv",
+                                    "source": port,
+                                    "sink": "audio_bulk" if is_left else "graphics_bulk",
+                                    "kind": kind,
+                                    "sysex_cmd": cmd,
+                                    "meta_text": meta_text,
+                                    "payload_hex": raw,
+                                }
+                            )
+                        except Exception:
+                            pass
+
+                self.patchbay.on_event = _on_event
+                def _on_control_midi(raw: bytes) -> None:
+                    """Browse knobs: CC3=Left LCD list, CC77=Right LCD list."""
+                    if len(raw) < 3 or (raw[0] & 0xF0) != 0xB0:
+                        return
+                    cc = raw[1] & 0x7F
+                    if cc == _BROWSE_CC_LEFT:
+                        side = "L"
+                    elif cc == _BROWSE_CC_RIGHT:
+                        side = "R"
+                    else:
+                        return
+                    with self._browse_side_lock:
+                        prev = self._browse_paint_side
+                        self._browse_paint_side = side
+                        self._browse_knob_t = time.perf_counter()
+                    # User is browsing again — allow list paint / browser priority
+                    self._lcd_content_mode = "browser"
+                    self._browser_until = time.perf_counter() + 0.4
+                    self._last_browser_paint_t = time.perf_counter()
+                    if prev != side:
+                        print(
+                            f"[nv] browser paint → Display "
+                            f"{'Left' if side == 'L' else 'Right'} "
+                            f"(knob CC{cc})",
+                            flush=True,
+                        )
+
+                self.patchbay.on_midi = _on_midi
+                self.patchbay.on_control_midi = _on_control_midi
+                self.patchbay.on_wine_control = _on_wine_control
+                self.patchbay.start_input_watch()
+                self._browser_keepalive_stop.clear()
+                threading.Thread(
+                    target=_browser_keepalive_loop,
+                    name="nv-browser-keepalive",
+                    daemon=True,
+                ).start()
+                print(
+                    f"[nv] VDJ/Wine input log → {vdj_csv_path}",
+                    flush=True,
+                )
+                print(
+                    "[nv] browser: knobs CC3/CC77 + mouse (song LED blink → "
+                    "Library View inject + keep-alive refresh)",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[nv] patchbay unavailable: {e}", flush=True)
+                self.patchbay = None
+
+    def log_urb(self, source: str, pid: int, ep: int, pl: bytes, *, latency_ms: float = 0.0) -> None:
+        if not self.csv:
+            return
+        self._csv_n += 1
+        if self._csv_n % self._csv_every != 0:
+            return
+        self.csv.write(
+            {
+                "direction": "host_to_dev",
+                "source": source,
+                "sink": "graphics_bulk" if pid == PID_GRAPHICS else "audio_bulk",
+                "product": f"{pid:04x}",
+                "product_name": PRODUCT_NAMES.get(pid, ""),
+                "ep": f"0x{ep:02x}",
+                "urb_len": len(pl),
+                "kind": "bulk_urb",
+                "latency_ms": f"{latency_ms:.3f}" if latency_ms else "",
+                "payload_hex": pl,
+                "note": "sampled" if self._csv_every > 1 else "",
+            }
+        )
+
+    def _play_action_list(
+        self,
+        actions: list[tuple[str, int, bytes]],
+        *,
+        reason: str,
+        pace: float = 0.0,
+    ) -> tuple[int, int]:
+        ok = fail = 0
+        print(
+            f"[nv] LCD stream ({reason}): {len(actions)} actions",
+            flush=True,
+        )
+        for kind, pid, payload in actions:
+            if kind == "sysex":
+                if self.painter.write_sysex(payload, pids=[pid], inter_chunk_s=0.0):
+                    ok += 1
+                else:
+                    fail += 1
+            else:
+                if self.painter.write_record(pid, 0x03, payload):
+                    ok += 1
+                else:
+                    fail += 1
+            if pace:
+                time.sleep(pace)
+        return ok, fail
+
+    def _play_wake_stream(self, *, reason: str, pace: float = 0.0) -> tuple[int, int]:
+        """Play wake corpus: filtered actions, or raw URB records (full mode)."""
+        actions = self.wake_actions
+        if actions and self.wake_mode not in ("full", "all", "session"):
+            return self._play_action_list(actions, reason=reason, pace=pace)
+
+        recs = self.wake_records or self.bulk_records
+        import os
+
+        env_n = os.environ.get("NV_WAKE_BULK_URBS")
+        n = min(len(recs), max(50, int(env_n))) if env_n is not None else len(recs)
+        ok = fail = 0
+        print(
+            f"[nv] LCD bulk wake ({reason}): {n} exact capture URBs mode={self.wake_mode}",
+            flush=True,
+        )
+        for pid, ep, pl in recs[:n]:
+            if self.painter.write_record(pid, ep, pl):
+                ok += 1
+            else:
+                fail += 1
+            if pace:
+                time.sleep(pace)
+        return ok, fail
+
+    def _play_bulk_bin(
+        self,
+        path: Path,
+        *,
+        reason: str,
+        pace: float = 0.0005,
+    ) -> tuple[int, int]:
+        """Replay exact USB bulk OUT URBs (write_record) — required for wake."""
+        if not path.is_file():
+            print(f"[nv] bulk missing ({reason}): {path}", flush=True)
+            return 0, 1
+        recs = load_bulk_records(path)
+        ok = fail = 0
+        print(
+            f"[nv] LCD bulk ({reason}): {len(recs)} URBs from {path.name}",
+            flush=True,
+        )
+        for pid, ep, pl in recs:
+            try:
+                if self.painter.write_record(pid, ep, pl):
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception:
+                fail += 1
+            if pace:
+                time.sleep(pace)
+        return ok, fail
+
+    def wake_lcds(self, *, reason: str = "start") -> None:
+        """Wake firmware with RAW bulk URBs, then live VDJ paints.
+
+        Re-encoded SysEx does NOT wake the NV panels. Order:
+          1) wake-open-plus-empty.bin (bulk-out open + WinBoat empty chrome)
+          2) else empty-deck-bulk.bin (WinBoat raw)
+          3) else bulk-out open-only / open actions
+        """
+        with self._wake_lock:
+            if self._lcd_woken and reason != "force":
+                print(f"[nv] LCD already woken — skip ({reason})", flush=True)
+                return
+
+            pace = float(getattr(self.args, "init_delay", 0.0) or 0.0005)
+            t0 = time.perf_counter()
+
+            # 1) Full clean wake from VDJ_start_stop_sequence (empty Controllers)
+            for label, path in (
+                ("winusb-empty-shell", WAKE_FULL_BIN),
+                ("winusb-open-only", WAKE_OPEN_ONLY_BIN),
+                ("hybrid-fallback", WAKE_HYBRID_BIN),
+            ):
+                if path.is_file() and self.wake_mode not in ("full", "all", "session"):
+                    ok, fail = self._play_bulk_bin(
+                        path, reason=f"{label}:{reason}", pace=pace
+                    )
+                    self._lcd_woken = True
+                    print(
+                        f"[nv] LCD wake done ({label}) ok={ok} fail={fail} "
+                        f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
+                        flush=True,
+                    )
+                    return
+
+            # 2) Fallback: bulk-out open slice / actions
+            has_stream = bool(self.wake_actions or self.wake_records or self.bulk_records)
+            if has_stream and not getattr(self.args, "sysex_only", False):
+                ok, fail = self._play_wake_stream(reason=reason, pace=pace)
+                self._lcd_woken = True
+                print(
+                    f"[nv] LCD wake done ok={ok} fail={fail} "
+                    f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
+                    flush=True,
+                )
+                return
+
+            # 3) Last resort (often insufficient alone)
+            ok = fail = 0
+            for m in (self.init_msgs or [])[:40]:
+                if self.painter.write_sysex(m, inter_chunk_s=0.0):
+                    ok += 1
+                else:
+                    fail += 1
+            self._lcd_woken = True
+            print(f"[nv] LCD sysex wake (weak) ok={ok} fail={fail}", flush=True)
+
+    def blank_lcds(self, *, reason: str = "shutdown") -> None:
+        """WinUSBNCap zero-chrome wipe while we still own bulk.
+
+        Capture end: blanked 0507/0524/0521/0505… overwrites VDJ metadata.
+        NOT logo SysEx — logos come from authorized re-enum after release.
+        Do NOT play wake/empty-deck open here (that re-paints after logos).
+        """
+        if not self.painter.handles:
+            print(f"[nv] LCD close ({reason}): no handles", flush=True)
+            return
+        if not self._wake_lock.acquire(blocking=False):
+            print(f"[nv] LCD close ({reason}): skip (busy)", flush=True)
+            return
+        try:
+            t0 = time.perf_counter()
+            ok = fail = 0
+            # Primary: raw close-bulk from WinUSBNCap (zeroish chrome wipe)
+            if CLOSE_BULK_BIN.is_file():
+                o, f = self._play_bulk_bin(
+                    CLOSE_BULK_BIN, reason=f"zero-wipe:{reason}", pace=0.0004
+                )
+                ok += o
+                fail += f
+            else:
+                try:
+                    from nv_screens.win_lifecycle import close_sequence
+
+                    for pid, msg in close_sequence():
+                        if self.painter.write_sysex(
+                            msg, pids=[pid], inter_chunk_s=0.0
+                        ):
+                            ok += 1
+                        else:
+                            fail += 1
+                        time.sleep(0.002)
+                except Exception as e:
+                    print(f"[nv] close fallback note: {e}", flush=True)
+            time.sleep(0.12)
+            print(
+                f"[nv] LCD zero-wipe ({reason}): ok={ok} fail={fail} "
+                f"in {(time.perf_counter() - t0) * 1000:.0f}ms "
+                f"(blank tiles; stock logos after bulk release + re-enum)",
+                flush=True,
+            )
+        finally:
+            self._wake_lock.release()
+
+    def run_init(self) -> None:
+        print("[nv] init sequence…", flush=True)
+        self.wake_lcds(reason="hybrid-init")
+
+    def paint_loop_bulk(self) -> None:
+        """
+        Dual-mode hot path:
+          1) Any live SysEx from Wine (pass_q) wins immediately (drop-old).
+          2) Otherwise replay bulk-long capture (proven LCD paint).
+        """
+        recs = self.bulk_records
+        if not recs:
+            self.paint_loop_sysex()
+            return
+        start = min(self.args.init_bulk_limit, len(recs))
+        loop_recs = recs[start:] if start < len(recs) else recs
+        if not loop_recs:
+            loop_recs = recs
+
+        # Prefer Graphics product records when graphics-only (Audio PID skipped anyway)
+        if self.args.graphics_only:
+            gfx = [r for r in loop_recs if r[0] == PID_GRAPHICS]
+            if gfx:
+                loop_recs = gfx
+
+        print(
+            f"[nv] hybrid paint: corpus={len(loop_recs)} URBs from {BULK_BIN.name} "
+            f"+ live SysEx override; inter_urb={self.args.paint_delay*1000:.2f}ms",
+            flush=True,
+        )
+        loop_n = 0
+        last_stat = time.time()
+        while not self.stop.is_set():
+            # Live frames first (waveform latency / drop-old)
+            pt = self.pass_q.get(timeout=0.0)
+            if pt is not None:
+                if isinstance(pt, tuple):
+                    payload, pids = pt
+                else:
+                    payload, pids = pt, None
+                self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
+                continue
+
+            t_loop = time.perf_counter()
+            for i, (pid, ep, pl) in enumerate(loop_recs):
+                if self.stop.is_set():
+                    break
+                # Abandon stale capture loop if live SysEx arrives mid-frame
+                if self.pass_q.pending():
+                    break
+                t0 = time.perf_counter()
+                self.painter.write_record(pid, ep, pl)
+                self.log_urb("capture", pid, ep, pl, latency_ms=(time.perf_counter() - t0) * 1000)
+                if self.args.paint_delay > 0:
+                    time.sleep(self.args.paint_delay)
+            loop_n += 1
+            elapsed = time.perf_counter() - t_loop
+            if time.time() - last_stat >= 5.0:
+                print(
+                    f"[nv] loops={loop_n} last_loop={elapsed*1000:.0f}ms "
+                    f"{self.painter.stats.summary()} pass_dropped={self.pass_q.dropped}",
+                    flush=True,
+                )
+                last_stat = time.time()
+
+    def paint_loop_sysex(self) -> None:
+        """
+        Hot paint from assembled 0509/0505 SysEx (avoids replaying capture
+        teardown / short MIDI that can flash the NV logo between loops).
+        """
+        paint = self.paint_msgs or []
+        status = self.status_msgs or []
+        if not paint and not status:
+            print("[nv] no paint corpus — idle (pass-through only)", flush=True)
+            while not self.stop.is_set():
+                pt = self.pass_q.get(timeout=0.2)
+                if pt is not None:
+                    if isinstance(pt, tuple):
+                        payload, pids = pt
+                    else:
+                        payload, pids = pt, None
+                    self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
+            return
+
+        # Default: push as fast as USB allows (hz only paces if > 0 via paint_delay)
+        hz = max(self.args.paint_hz, 0.0)
+        period = (1.0 / hz) if hz > 0 else 0.0
+        # Delay capture reel so startup isn't stuck on old WinBoat frames;
+        # live VDJ F0 47 should arrive first after factory displays bind.
+        capture_grace_s = float(
+            __import__("os").environ.get("NV_CAPTURE_GRACE_S", "12")
+        )
+        capture_start = time.perf_counter() + max(0.0, capture_grace_s)
+        print(
+            f"[nv] sysex HOT paint: paint_frames={len(paint)} status={len(status)} "
+            f"(capture grace {capture_grace_s:.0f}s — prefer live F0 47)",
+            flush=True,
+        )
+        pi = si = 0
+        last_stat = time.time()
+        while not self.stop.is_set():
+            t0 = time.perf_counter()
+            pt = self.pass_q.get(timeout=0.0)
+            # After VDJ closed, stop capture paint (hold last frame) until auto-exit
+            if (
+                self._vdj_seen_once
+                and not self._vdj_running
+                and self._vdj_gone_since is not None
+            ):
+                self.stop.wait(0.5)
+                continue
+
+            if pt is not None:
+                if isinstance(pt, tuple):
+                    payload, pids = pt
+                else:
+                    payload, pids = pt, None
+                self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
+                self.mark_activity()
+            elif time.perf_counter() < getattr(self, "_live_paint_until", 0.0):
+                # Live F0 47 from factory displays — do not overlay capture reel
+                self.stop.wait(0.01)
+            elif time.perf_counter() < capture_start:
+                # Wait for VDJ factory paint before falling back to capture
+                self.stop.wait(0.05)
+            else:
+                # denser paint: several tiles then a status tick (fallback only)
+                if paint:
+                    for _ in range(3):
+                        m = paint[pi % len(paint)]
+                        pi += 1
+                        self.painter.write_sysex(m, inter_chunk_s=0.0)
+                        if self.pass_q.pending():
+                            break
+                if status and (pi % 6 == 0):
+                    m = status[si % len(status)]
+                    si += 1
+                    self.painter.write_sysex(m, inter_chunk_s=0.0)
+            spent = time.perf_counter() - t0
+            if period > 0:
+                sleep_for = period - spent
+                if sleep_for > 0:
+                    self.stop.wait(sleep_for)
+            if time.time() - last_stat >= 5.0:
+                print(
+                    f"[nv] {self.painter.stats.summary()} pass_dropped={self.pass_q.dropped} "
+                    f"frame_i={pi}",
+                    flush=True,
+                )
+                last_stat = time.time()
+
+    def live_loop(self) -> None:
+        print(
+            "[nv] LIVE BRIDGE ONLY — Wine → USB-MIDI cells → libusb dual bulk",
+            flush=True,
+        )
+        print("[nv] NO capture/test paint — LCD content is VDJ only", flush=True)
+        print(
+            "[nv] browser: full 0..6 replace + strip-0 scroll-shift on active side "
+            f"(CC{_BROWSE_CC_LEFT}=L CC{_BROWSE_CC_RIGHT}=R)",
+            flush=True,
+        )
+        last_stat = time.time()
+        while not self.stop.is_set():
+            # Timed-out partial browser gens (same generation only)
+            for fr_side, frame in self._browser_asm.poll_timeouts():
+                self.pass_q.put_browser_frame(fr_side, frame)
+
+            # Always drain priority first (browser tiles + protected waveforms).
+            # Never drop protected 0509. Light drop of non-priority backlog only
+            # while browser list is actively updating.
+            browsing = time.perf_counter() < getattr(self, "_browser_until", 0.0)
+            if browsing:
+                self.pass_q.drop_large_paint()
+            batch = self.pass_q.drain_priority(max_n=64)
+            if not batch and not browsing:
+                batch = self.pass_q.drain(max_n=64)
+            elif not batch:
+                batch = self.pass_q.drain(max_n=32)
+            if not batch:
+                pt = self.pass_q.get(timeout=0.012)
+                if pt is not None:
+                    if (
+                        isinstance(pt, tuple)
+                        and len(pt) == 3
+                        and pt[0] == "browser_frame"
+                    ):
+                        batch = list(pt[2])
+                    else:
+                        batch = [pt]
+            for item in batch:
+                if isinstance(item, tuple) and len(item) == 3 and item[0] == "browser_frame":
+                    for payload, pids in item[2]:
+                        self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
+                    self.mark_activity()
+                    continue
+                if isinstance(item, tuple) and len(item) == 2:
+                    payload, pids = item
+                else:
+                    payload, pids = item, None
+                self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
+                self.mark_activity()
+            if time.time() - last_stat >= 5.0:
+                print(
+                    f"[nv] bridge {self.painter.stats.summary()} "
+                    f"pass_dropped={self.pass_q.dropped} "
+                    f"coalesced={getattr(self.pass_q, 'coalesced', 0)} "
+                    f"{self._browser_asm.summary()} "
+                    f"vdj={'up' if self._vdj_running else 'down'}",
+                    flush=True,
+                )
+                last_stat = time.time()
+
+    def start_pass_through_listener(self) -> None:
+        port = self.args.pass_through_port
+        if not port:
+            return
+
+        def worker() -> None:
+            import subprocess
+
+            print(f"[nv] pass-through listening on {port}", flush=True)
+            proc = subprocess.Popen(
+                ["amidi", "-p", port, "-d"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            buf = bytearray()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if self.stop.is_set():
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = bytes.fromhex(line.replace(" ", ""))
+                    except ValueError:
+                        continue
+                    for b in chunk:
+                        if b == 0xF0:
+                            buf = bytearray([0xF0])
+                        elif buf:
+                            buf.append(b)
+                            if b == 0xF7:
+                                msg = bytes(buf)
+                                buf.clear()
+                                self.pass_q.put((sysex_to_usb_midi(msg), None))
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    proc.kill()
+
+        self._pt_thread = threading.Thread(target=worker, name="nv-pass", daemon=True)
+        self._pt_thread.start()
+
+    def start_vdj_monitor(self) -> None:
+        if self._vdj_monitor and self._vdj_monitor.is_alive():
+            return
+
+        # Exit promptly so facade leaves the patchbay when VDJ quits
+        idle_after = float(getattr(self.args, "idle_after_vdj_s", 3.0))
+
+        def monitor() -> None:
+            print(
+                f"[nv] VDJ monitor started "
+                f"(auto-exit {idle_after:.0f}s after VDJ closes if idle)",
+                flush=True,
+            )
+            while not self.stop.is_set():
+                running = vdj_running()
+                now = time.time()
+
+                if running and not self._vdj_running:
+                    print("[nv] VirtualDJ started", flush=True)
+                    self._vdj_seen_once = True
+                    self._vdj_gone_since = None
+                    self.mark_activity()
+
+                    def _on_start() -> None:
+                        try:
+                            time.sleep(self.args.settle)
+                            if not self.painter.handles:
+                                try:
+                                    self.painter.open()
+                                except Exception as e:
+                                    print(f"[nv] claim on start failed: {e}", flush=True)
+                                    return
+                            # Bulk wake then live bridge (live-only never loops capture)
+                            try:
+                                self.wake_lcds(reason="vdj-start")
+                            except Exception as e:
+                                print(f"[nv] wake_lcds error: {e}", flush=True)
+                            if getattr(self.args, "live_only", False):
+                                print(
+                                    "[nv] live-only: bulk wake done — VDJ paint on facade",
+                                    flush=True,
+                                )
+                                return
+                        except Exception as e:
+                            print(f"[nv] on_start worker error: {e}", flush=True)
+
+                    threading.Thread(target=_on_start, name="vdj-start", daemon=True).start()
+
+                elif not running and self._vdj_running:
+                    # VDJ process gone — send logo SysEx *now* while we still
+                    # own bulk (Wine may already have dropped MIDI; do not wait
+                    # for a VDJ teardown frame that never arrives).
+                    print("[nv] VirtualDJ stopped — logo SysEx then clean rehook", flush=True)
+                    self._vdj_gone_since = now
+                    try:
+                        self.blank_lcds(reason="vdj-stop")
+                        self._logo_sysex_done = True
+                    except Exception as e:
+                        print(f"[nv] logo SysEx on VDJ stop failed: {e}", flush=True)
+                    print(
+                        f"[nv] logo SysEx sent; exit in {idle_after:.0f}s "
+                        f"(USB reset + ALSA rehook on shutdown)",
+                        flush=True,
+                    )
+
+                elif not running and self._vdj_seen_once and self._vdj_gone_since is not None:
+                    gone_for = now - self._vdj_gone_since
+                    idle_for = now - self._last_activity
+                    # Exit when VDJ has been gone long enough
+                    if gone_for >= idle_after:
+                        self._exit_reason = (
+                            f"vdj_closed_{gone_for:.0f}s "
+                            f"(idle_bridge={idle_for:.0f}s)"
+                        )
+                        print(
+                            f"[nv] VDJ closed for {gone_for:.0f}s — "
+                            f"shutting down nv-screens ({self._exit_reason})",
+                            flush=True,
+                        )
+                        self.stop.set()
+                        break
+
+                elif running:
+                    self._vdj_gone_since = None
+
+                self._vdj_running = running
+                time.sleep(1.0)
+
+        self._vdj_monitor = threading.Thread(target=monitor, name="vdj-monitor", daemon=True)
+        self._vdj_monitor.start()
+
+    def run(self) -> int:
+        self.setup()
+        if self.args.live_only:
+            print(
+                "[nv] mode=live-only (Wine→nv-screens→libusb; NO capture paint)",
+                flush=True,
+            )
+        elif not self.args.no_wait:
+            wait_for_vdj(timeout_s=self.args.wait_timeout)
+            if self.stop.is_set():
+                return 0
+        else:
+            print("[nv] --no-wait: claim Graphics immediately", flush=True)
+
+        if self.args.settle > 0:
+            time.sleep(self.args.settle)
+
+        self.start_pass_through_listener()
+        self.start_vdj_monitor()
+        # Claim Graphics before Wine opens MIDI so ALSA Graphics is gone
+        if self.args.no_wait or self.args.live_only:
+            try:
+                self.painter.open()
+            except Exception as e:
+                print(f"[nv] claim failed: {e}", file=sys.stderr)
+                return 1
+            # Immediate bulk wake so panels leave logo before live SysEx
+            if self.args.live_only:
+                try:
+                    self.wake_lcds(reason="claim")
+                except Exception as e:
+                    print(f"[nv] wake after claim failed: {e}", flush=True)
+        try:
+            if self.args.live_only:
+                self.live_loop()
+            else:
+                self.run_init()
+                if self.args.full_bulk_loop and self.bulk_records and not self.args.sysex_only:
+                    self.paint_loop_bulk()
+                else:
+                    self.paint_loop_sysex()
+        except KeyboardInterrupt:
+            print("\n[nv] stop requested", flush=True)
+        finally:
+            self.stop.set()
+            reason = self._exit_reason or "stop"
+            print(
+                f"[nv] releasing. reason={reason} {self.painter.stats.summary()}",
+                flush=True,
+            )
+
+            # 0) Stop ALSA pumps FIRST — prevents SEGV from MIDI thread writing
+            #    CSV/files while main closes them (coredump: TextIOWrapper_close
+            #    + heap free race with snd_seq_event_input).
+            if self.patchbay:
+                try:
+                    self.patchbay.on_midi = None
+                    self.patchbay.on_event = None
+                    self.patchbay.on_control_midi = None
+                    self.patchbay.close()
+                except Exception as e:
+                    print(f"[nv] patchbay close: {e}", flush=True)
+                self.patchbay = None
+                print("[nv] facade closed", flush=True)
+
+            # 1) Logo wipe while bulk still owned (skip if done on vdj-stop)
+            if self.painter.handles and not self._logo_sysex_done:
+                try:
+                    self.blank_lcds(reason=f"exit:{reason}")
+                    self._logo_sysex_done = True
+                except Exception as e:
+                    print(f"[nv] logo SysEx on exit failed: {e}", flush=True)
+            elif self._logo_sysex_done:
+                print("[nv] logo SysEx already sent on VDJ stop", flush=True)
+
+            # 2) Close logs after MIDI pumps are dead (idempotent)
+            if self.csv:
+                try:
+                    self.csv.close()
+                except Exception:
+                    pass
+                self.csv = None
+            if getattr(self, "_vdj_csv", None):
+                try:
+                    self._vdj_csv.close()
+                except Exception:
+                    pass
+                self._vdj_csv = None
+
+            # 3) Release libusb bulk (must be free before authorized re-enum)
+            import os
+
+            do_stock = os.environ.get("NV_USB_RESET_ON_EXIT", "1").lower() not in (
+                "0",
+                "no",
+                "false",
+            )
+            try:
+                self.painter.close(reattach=False)
+                print("[nv] bulk released (no reattach — stock re-enum next)", flush=True)
+            except Exception as e:
+                print(f"[nv] close bulk: {e}", flush=True)
+                try:
+                    self.painter.close(reattach=True)
+                except Exception:
+                    pass
+
+            # 4) authorized re-enum → stock logos
+            if do_stock and not self.args.keep_claimed:
+                try:
+                    ok = self.painter.stock_firmware_reenum(wipe_already_done=True)
+                    if not ok:
+                        time.sleep(0.5)
+                        self.painter.stock_firmware_reenum(wipe_already_done=False)
+                except Exception as e:
+                    print(f"[nv] stock re-enum error: {e}", flush=True)
+            else:
+                print(
+                    "[nv] stock re-enum skipped (keep_claimed or NV_USB_RESET_ON_EXIT=0)",
+                    flush=True,
+                )
+
+            print(
+                "[nv] exited cleanly (zero-wipe bulk → release → authorized re-enum)",
+                flush=True,
+            )
+        return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Low-latency NV dual-screen host for VDJ under Wine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Do not wait for VirtualDJ process",
+    )
+    ap.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for VDJ (0=forever)",
+    )
+    ap.add_argument(
+        "--settle",
+        type=float,
+        default=0.4,
+        help="Seconds after VDJ detect before claiming bulk (let Wine open Control)",
+    )
+    ap.add_argument(
+        "--idle-after-vdj-s",
+        type=float,
+        default=2.0,
+        help="After VirtualDJ stops, exit nv-screens after this many seconds "
+        "(default 2 — removes facade from patchbay quickly). "
+        "0 = never auto-exit on VDJ close.",
+    )
+    ap.add_argument(
+        "--wake-mode",
+        choices=("open", "chrome", "full"),
+        default=None,
+        help="LCD wake: open=init only, chrome=blank UI no capture titles (default), "
+        "full=entire bulk-out (old track flash). Env NV_WAKE_MODE overrides if unset.",
+    )
+    ap.add_argument(
+        "--graphics-only",
+        action="store_true",
+        help="Claim Graphics MIDI bulk only — leave NV Audio fully to ALSA/VDJ",
+    )
+    ap.add_argument(
+        "--sysex-only",
+        action="store_true",
+        help="Use SysEx→cells paint instead of raw bulk capture replay",
+    )
+    ap.add_argument(
+        "--live-only",
+        action="store_true",
+        help="Only forward inbound Wine SysEx (no capture replay). "
+        "Default hybrid = SysEx 0509/0505 hot paint + live override.",
+    )
+    ap.add_argument(
+        "--full-bulk-loop",
+        action="store_true",
+        help="Loop entire bulk-long.bin (can flash logo on capture teardown segments)",
+    )
+    ap.add_argument(
+        "--init-bulk-limit",
+        type=int,
+        default=800,
+        help="How many bulk URBs from capture to treat as init before loop",
+    )
+    ap.add_argument(
+        "--init-delay",
+        type=float,
+        default=0.0003,
+        help="Pace between init URBs (s); paint path uses --paint-delay",
+    )
+    ap.add_argument(
+        "--paint-delay",
+        type=float,
+        default=0.0,
+        help="Delay between paint URBs (s). Default 0 = lowest latency",
+    )
+    ap.add_argument(
+        "--paint-hz",
+        type=float,
+        default=30.0,
+        help="Target frame rate for sysex-only mode (default 30)",
+    )
+    ap.add_argument(
+        "--write-timeout-ms",
+        type=int,
+        default=500,
+        help="libusb bulk write timeout (ms) — keep low to avoid stuck queues",
+    )
+    ap.add_argument(
+        "--pass-through-port",
+        default="",
+        help="Optional amidi port to listen for SysEx and bulk-forward (e.g. hw:5,0)",
+    )
+    ap.add_argument(
+        "--csv-log",
+        default="",
+        help="Append live paint traffic to this CSV (e.g. captures/live.csv)",
+    )
+    ap.add_argument(
+        "--csv-every",
+        type=int,
+        default=10,
+        help="Log every Nth URB to CSV (default 10; use 1 for full detail — larger files)",
+    )
+    ap.add_argument(
+        "--csv-max-hex",
+        type=int,
+        default=128,
+        help="Max hex chars of payload stored per CSV row",
+    )
+    ap.add_argument(
+        "--patchbay",
+        action="store_true",
+        help="Expose ALSA seq ports (nv-screens) for aconnect / qpwgraph routing",
+    )
+    ap.add_argument(
+        "--no-virtual-graphics",
+        action="store_true",
+        help="Do not create virtual 'NV Graphics' ALSA client (default: create it "
+        "with --patchbay so VDJ sees Graphics while real OUT is libusb)",
+    )
+    ap.add_argument(
+        "--no-display-ports",
+        action="store_true",
+        help="With virtual Graphics, only create Numark NV Display Left "
+        "(skip Display Right)",
+    )
+    ap.add_argument(
+        "--routes",
+        default="",
+        help="Optional routes JSON (from nv_patchbay.py --save-routes)",
+    )
+    ap.add_argument(
+        "--vdj-csv",
+        default="",
+        help="CSV for Wine→vdj_in events (default captures/vdj-from-wine.csv)",
+    )
+    ap.add_argument(
+        "--allow-sysex",
+        default="0509,0531,0505",
+        help="Comma-separated SysEx command hex codes to forward (e.g. 0509,0531)",
+    )
+    ap.add_argument(
+        "--metadata-throttle-ms",
+        type=int,
+        default=150,
+        help="Minimum ms between forwarded metadata SysEx messages per command (default 150)",
+    )
+    ap.add_argument(
+        "--keep-claimed",
+        action="store_true",
+        help="Do not reattach kernel drivers on exit",
+    )
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    daemon = NvScreensDaemon(args)
+
+    def _sig(_signum, _frame):
+        daemon.stop.set()
+
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+    return daemon.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

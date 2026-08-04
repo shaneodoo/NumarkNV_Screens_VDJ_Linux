@@ -1,7 +1,32 @@
+# Runtime / local only
+captures/**
+!captures/.gitkeep
+*.log
+*.csv
+live-bridge.txt
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
 *~
 .DS_Store
-*.log
-captures/vdj-from-wine*.csv
-captures/live-bridge.txt
+.idea/
+.vscode/
+
+# Large / private reverse-engineering (keep local archive outside repo)
+*.pcapng
+*.pcap
+*.syx
+snapshots/
+nv-screens-private-archive/
+
+# Wine rebuild artefacts
+wine-patch/**/*.o
+wine-patch/**/*.orig
+wine-patch/winealsa.so.system-backup

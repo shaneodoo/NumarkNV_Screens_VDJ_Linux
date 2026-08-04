@@ -154,6 +154,8 @@ class BulkHandle:
     pid: int
     ifn: int
     ep_out: int
+    # Every interface we detached (Graphics exclusive may detach AC+MIDI)
+    detached_ifns: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -216,20 +218,29 @@ class NvBulkPainter:
             # Audio: MIDI bulk only — hide Audio *MIDI* (facade "NV Audio") but
             # keep PCM for Wine/VDJ sound + NUMARK NV audio button.
             midi_only = pid == PID_AUDIO
-            ifn, ep = self._claim_midi(dev, midi_only=midi_only)
-            self.handles.append(BulkHandle(dev=dev, pid=pid, ifn=ifn, ep_out=ep))
+            ifn, ep, detached = self._claim_midi(dev, midi_only=midi_only)
+            self.handles.append(
+                BulkHandle(
+                    dev=dev,
+                    pid=pid,
+                    ifn=ifn,
+                    ep_out=ep,
+                    detached_ifns=detached,
+                )
+            )
             mode = (
                 "midi-only (PCM free; facade = NV Audio / Display Left)"
                 if midi_only
                 else "exclusive (facade = NV Graphics / Display Right)"
             )
             print(
-                f"[nv] claimed 15e4:{pid:04x} if={ifn} ep=0x{ep:02x} ({mode})",
+                f"[nv] claimed 15e4:{pid:04x} if={ifn} ep=0x{ep:02x} "
+                f"detached={detached} ({mode})",
                 flush=True,
             )
             if midi_only:
-                # Detaching MIDI often drops the whole ALSA card (PCM gone).
-                # Best-effort rebind of AudioControl + Streaming for Wine sound.
+                # Detaching MIDI can drop the whole ALSA card (PCM gone).
+                # Best-effort rebind of AC+AS without root when possible.
                 try:
                     self._rebind_audio_pcm(dev)
                 except Exception as e:
@@ -337,7 +348,7 @@ class NvBulkPainter:
 
     def _claim_midi(
         self, dev: usb.core.Device, *, midi_only: bool = False
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[int]]:
         try:
             cfg = dev.get_active_configuration()
         except usb.core.USBError:
@@ -365,6 +376,8 @@ class NvBulkPainter:
         if midi_ifn is None or ep_out is None:
             raise RuntimeError(f"No MIDI bulk OUT on {dev.idProduct:04x}")
 
+        detached: list[int] = []
+
         def _detach(ifn: int) -> None:
             for attempt in range(3):
                 try:
@@ -374,13 +387,15 @@ class NvBulkPainter:
                             flush=True,
                         )
                         dev.detach_kernel_driver(ifn)
+                        if ifn not in detached:
+                            detached.append(ifn)
                     break
                 except (NotImplementedError, usb.core.USBError) as e:
                     print(f"[nv] detach if{ifn} attempt {attempt}: {e}", flush=True)
                     time.sleep(0.15)
 
         if midi_only:
-            # Leave AudioControl + AudioStreaming (PCM) on kernel for WASAPI
+            # Leave AudioControl + AudioStreaming (PCM) on kernel for sound
             _detach(midi_ifn)
         else:
             # Exclusive: detach every interface so ALSA card vanishes
@@ -388,7 +403,7 @@ class NvBulkPainter:
                 _detach(intf.bInterfaceNumber)
 
         usb.util.claim_interface(dev, midi_ifn)
-        return midi_ifn, ep_out
+        return midi_ifn, ep_out, detached
 
     def close(self, reattach: bool = True) -> None:
         for h in self.handles:
@@ -397,16 +412,165 @@ class NvBulkPainter:
             except Exception:
                 pass
             if reattach:
-                try:
-                    h.dev.attach_kernel_driver(h.ifn)
-                    print(f"[nv] reattached kernel on {h.pid:04x}", flush=True)
-                except Exception as e:
-                    print(
-                        f"[nv] leave detached {h.pid:04x}: {e} "
-                        "(unplug/replug if ALSA MIDI missing)",
-                        flush=True,
-                    )
+                # Reattach *every* interface we detached (not only the paint IF)
+                ifns = list(h.detached_ifns) if h.detached_ifns else [h.ifn]
+                if h.ifn not in ifns:
+                    ifns.append(h.ifn)
+                for ifn in ifns:
+                    try:
+                        h.dev.attach_kernel_driver(ifn)
+                        print(
+                            f"[nv] reattached kernel if{ifn} on {h.pid:04x}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"[nv] reattach if{ifn} {h.pid:04x}: {e}",
+                            flush=True,
+                        )
+            try:
+                usb.util.dispose_resources(h.dev)
+            except Exception:
+                pass
         self.handles.clear()
+        # Brief settle so USB is quiet before optional device reset
+        if not reattach:
+            time.sleep(0.05)
+
+    def _wait_alsa_restored(self, timeout_s: float = 5.0) -> bool:
+        """Poll until Graphics + Audio MIDI show in amidi (no root needed)."""
+        import subprocess
+
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                out = subprocess.check_output(
+                    ["amidi", "-l"], text=True, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                out = ""
+            has_g = "NV Graphics" in out or "Graphics" in out
+            has_a = "NV Audio" in out
+            has_pcm = any(
+                p.read_text().strip().lower() == "15e4:1033"
+                for p in Path("/proc/asound").glob("card*/usbid")
+                if p.is_file()
+            )
+            if has_g and has_a and has_pcm:
+                print(
+                    f"[nv] ALSA restored in {time.time() - t0:.1f}s "
+                    "(Graphics+Audio MIDI + PCM)",
+                    flush=True,
+                )
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _attach_all_kernel_drivers(self, pid: int) -> None:
+        """Bind snd-usb-audio on every unbound IF (user-level, no root)."""
+        dev = usb.core.find(idVendor=VID, idProduct=pid)
+        if dev is None:
+            return
+        try:
+            try:
+                dev.get_active_configuration()
+            except usb.core.USBError:
+                try:
+                    dev.set_configuration()
+                except Exception:
+                    pass
+            for ifn in range(0, 4):
+                try:
+                    if not dev.is_kernel_driver_active(ifn):
+                        dev.attach_kernel_driver(ifn)
+                        print(
+                            f"[nv] attach_kernel if{ifn} on {pid:04x}",
+                            flush=True,
+                        )
+                except (usb.core.USBError, NotImplementedError, ValueError):
+                    pass
+        except Exception as e:
+            print(f"[nv] attach_all {pid:04x}: {e}", flush=True)
+
+    def stock_firmware_reenum(self, *, wipe_already_done: bool = False) -> bool:
+        """Stock restore via tools/usb-reset-nv.sh (sudo -n).
+
+        WinUSBNCap finding:
+          1) zero-chrome bulk wipe (skip if wipe_already_done — host did it)
+          2) authorized 0→1 → firmware logos
+
+        Must run AFTER bulk is fully released when wipe_already_done=True.
+        """
+        import subprocess
+
+        tools = Path(__file__).resolve().parents[1] / "tools"
+        if not tools.is_dir():
+            tools = Path.home() / "src/nv-screens/tools"
+        usb_script = tools / "usb-reset-nv.sh"
+        if not usb_script.is_file():
+            print(f"[nv] missing {usb_script}", flush=True)
+            return False
+
+        time.sleep(0.35)
+        cmd = ["sudo", "-n", str(usb_script.resolve())]
+        if wipe_already_done:
+            cmd.append("--reenum-only")
+            print("[nv] stock re-enum only (zero-wipe already done)…", flush=True)
+        else:
+            print("[nv] stock wipe + re-enum (WinUSBNCap close bulk → logos)…", flush=True)
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception as e:
+            print(f"[nv] stock re-enum failed to spawn: {e}", flush=True)
+            return False
+
+        for line in (r.stdout or "").splitlines():
+            print(line, flush=True)
+        for line in (r.stderr or "").splitlines():
+            print(f"[nv-usb-reset:err] {line}", flush=True)
+
+        ok = r.returncode == 0
+        if ok:
+            print("[nv] stock restore OK — blank tiles + firmware logos + ALSA", flush=True)
+        else:
+            print(
+                f"[nv] stock restore rc={r.returncode} — "
+                f"ensure: sudo -n {usb_script} (NOPASSWD, not under bwrap)",
+                flush=True,
+            )
+        self._wait_alsa_restored(timeout_s=5.0)
+        return ok
+
+    def restore_after_session(self, *, usb_reset: bool = True) -> None:
+        """After bulk release: optional attach leftovers, then stock re-enum.
+
+        Preferred path for logos is stock_firmware_reenum() (authorized 0→1).
+        """
+        # Best-effort attach if anything still unbound (usually empty after re-enum)
+        for pid in (PID_GRAPHICS, PID_AUDIO):
+            self._attach_all_kernel_drivers(pid)
+        time.sleep(0.2)
+
+        if usb_reset:
+            if self.stock_firmware_reenum():
+                return
+            print(
+                "[nv] stock re-enum failed — MIDI may still return without logos",
+                flush=True,
+            )
+
+        if self._wait_alsa_restored(timeout_s=3.0):
+            print("[nv] ALSA present (logos may need manual usb-reset-nv.sh)", flush=True)
+        else:
+            print(
+                "[nv] restore incomplete — run: sudo -n tools/usb-reset-nv.sh",
+                flush=True,
+            )
 
     def write_bulk(
         self,

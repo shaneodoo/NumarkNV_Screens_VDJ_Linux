@@ -28,11 +28,11 @@ wine reg add 'HKCU\Software\Wine\Drivers' /v Audio /t REG_SZ /d alsa /f >/dev/nu
 # 2) Standalone audio definition (NUMARK NV button)
 echo "[2] Installing Devices/Numark_NV_Audio.xml"
 mkdir -p "$VDJ_DEV"
-cp -f "$ROOT/tools/vdj-devices/Numark_NV_Audio.xml" "$VDJ_DEV/Numark_NV_Audio.xml" 2>/dev/null || \
+cp -f "$ROOT/scripts/vdj-devices/Numark_NV_Audio.xml" "$VDJ_DEV/Numark_NV_Audio.xml" 2>/dev/null || \
   cp -f "$VDJ_DEV/Numark_NV_Audio.xml" "$VDJ_DEV/Numark_NV_Audio.xml" 2>/dev/null || true
 # Prefer repo copy if present
-if [[ -f "$ROOT/tools/vdj-devices/Numark_NV_Audio.xml" ]]; then
-  cp -f "$ROOT/tools/vdj-devices/Numark_NV_Audio.xml" "$VDJ_DEV/Numark_NV_Audio.xml"
+if [[ -f "$ROOT/scripts/vdj-devices/Numark_NV_Audio.xml" ]]; then
+  cp -f "$ROOT/scripts/vdj-devices/Numark_NV_Audio.xml" "$VDJ_DEV/Numark_NV_Audio.xml"
 fi
 ls -la "$VDJ_DEV/"
 

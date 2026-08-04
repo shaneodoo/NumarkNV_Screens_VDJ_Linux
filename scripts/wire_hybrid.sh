@@ -158,8 +158,9 @@ else
 fi
 
 # Kernel Control: with facade, Wine must NOT seq-link kernel Control.
-# HW jogs/pads: kernel → facade bridge only → Wine. Direct Wine↔kernel
-# Control shows as a messy mesh in qpwgraph and can double LEDs/jogs.
+# HW jogs/pads/FX knobs: kernel → facade rebroadcast → Wine (same client as
+# factory NMNV). Direct Wine↔kernel would deliver the wrong client id and
+# double LEDs/jogs if both paths were live.
 if [[ -n "${CTL:-}" ]]; then
   # Prefer kernel client id (not a user client that happens to match the name)
   CTL_K=$(find_kernel_client "NV Control")
@@ -169,7 +170,11 @@ if [[ -n "${CTL:-}" ]]; then
     disc "${CTL_ISO}:0" "${WINE}:$i"
   done
   if [[ -n "${GFX_USER:-}" ]]; then
-    echo "Kernel NV Control isolated from Wine (facade bridges jogs/pads)"
+    # Re-assert kernel ↔ facade Control (patchbay also does this on open;
+    # re-wire after Wine appears so FX knobs/jogs stay bridged).
+    soft_conn "${CTL_ISO}:0" "${GFX_USER}:0"
+    soft_conn "${GFX_USER}:0" "${CTL_ISO}:0"
+    echo "Kernel NV Control isolated from Wine; linked ↔ facade:0 (FX knobs/jogs)"
   else
     conn "${CTL_ISO}:0" "${WINE}:0"
     for i in "${WINE_OUTS[@]}"; do

@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# VirtualDJ desktop icon — clean nv-screens bridge, then Wine VDJ
+# VirtualDJ + Numark NV dual LCDs
 #
-#   1) KILL any existing nv-screens / graphics_guard
-#   2) START nv-screens fresh:
-#        • claim real NV Graphics via libusb (kernel ALSA card gone)
-#        • virtual ALSA "NV Graphics" facade so VDJ still sees Graphics IN
-#        • BRIDGE ONLY: Wine MIDI → USB-MIDI bulk cells → real Graphics
-#        • NO capture/test CSV paint loop
-#   3) START Wine VirtualDJ
-#   4) Wire: Wine ⟷ Control/Audio/virtual Graphics; outs → vdj_in
-#      Guard: Wine never ALSA-connects to *kernel* NV Graphics
+# - nv-screens runs OUTSIDE bwrap (so sudo USB re-enum works on exit)
+# - only Wine is bwrap'd for winealsa.so
+# - wire Wine once (no retry thrash in qpwgraph)
+# - on exit: stop host → authorized 0→1 hub re-enum → firmware logos
 #
 set -euo pipefail
 
@@ -19,44 +14,33 @@ export WINEPREFIX
 export WINEESYNC="${WINEESYNC:-1}"
 export WINEFSYNC="${WINEFSYNC:-1}"
 export WINEDEBUG="${WINEDEBUG:--d2d,-dwrite,-font}"
+export NV_FACADE_NAME_MODE="${NV_FACADE_NAME_MODE:-factory}"
 
-# Re-exec under bubblewrap so Wine loads Numark-aware winealsa.so (VID/PID +
-# hide kernel "MIDI 1" / PipeWire junk). Desktop icon must do this or factory
-# displays never bind. Set NV_SKIP_WINEALSA_BWRAP=1 to disable.
 _NV_SO="$ROOT/wine-patch/x86_64-unix/winealsa.so"
 _NV_DST="/usr/lib64/wine-wow64/wine/x86_64-unix/winealsa.so"
-if [[ -z "${NV_INSIDE_WINEALSA_BWRAP:-}" && -z "${NV_SKIP_WINEALSA_BWRAP:-}" \
-      && -f "$_NV_SO" && -x /usr/bin/bwrap ]]; then
-  export NV_INSIDE_WINEALSA_BWRAP=1
-  export NV_FACADE_NAME_MODE="${NV_FACADE_NAME_MODE:-factory}"
-  exec /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
-    "$0" "$@"
-fi
 
 DOS="$WINEPREFIX/dosdevices"
 VDJ_SETTINGS="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/settings.xml"
-MOUNT="${NV_LIBRARY_MOUNT:-}"
+MOUNT="/mnt/shane1"
 EXE="$WINEPREFIX/drive_c/Program Files/VirtualDJ/virtualdj.exe"
 
-LOG="/tmp/nv-vdj-launch.log"
+LOG="/tmp/nv-midi-connect.log"
 NV_LOG="/tmp/nv-screens-live.log"
 NV_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/nv-screens.pid"
-GUARD_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/nv-graphics-guard.pid"
-NV_SCRIPT="$ROOT/tools2/nv_screens.py"
-WIRE_SCRIPT="$ROOT/tools/wire_hybrid.sh"
-GUARD_SCRIPT="$ROOT/tools/graphics_guard.sh"
+NV_SCRIPT="$ROOT/bin/nv-screens"
+WIRE_SCRIPT="$ROOT/scripts/wire_hybrid.sh"
+USB_RESET="$ROOT/scripts/usb-reset-nv.sh"
+CSV_LOG="$ROOT/captures/vdj-from-wine-live.csv"
+BRIDGE_LOG="$ROOT/captures/live-bridge.txt"
 
 mkdir -p "$HOME/bin" "$ROOT/captures"
 echo "$(date -Is) === desktop launch ===" >>"$LOG"
-
 log() { echo "$(date -Is) $*" >>"$LOG"; }
 
-# --- optional library drive (NV_LIBRARY_MOUNT) ---
-if [[ -n "${MOUNT:-}" && -d "${MOUNT}/DJ" ]]; then
+if [[ -d "$MOUNT/DJ" ]]; then
   ln -sfn "$MOUNT" "$DOS/d:"
+  [[ -b /dev/sdb1 ]] && ln -sfn /dev/sdb1 "$DOS/d::" || true
   ln -sfn "$MOUNT/DJ" "$HOME/Music/DJ" || true
-elif [[ -n "${MOUNT:-}" && -d "$MOUNT" ]]; then
-  ln -sfn "$MOUNT" "$DOS/d:"
 fi
 ln -sfn "$HOME" "$DOS/z:"
 rm -f "$DOS/j:" "$DOS/j::" "$DOS/y:" 2>/dev/null || true
@@ -79,7 +63,10 @@ p.write_text(t, encoding="utf-8")
 PY
 fi
 
-python3 "$HOME/bin/vdj-set-nv-audio.py" 2>/dev/null || true
+FAV="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/Folders/DJ.vdjfolder"
+mkdir -p "$(dirname "$FAV")"
+printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<FavoriteFolder path="D:\DJ" />' > "$FAV"
+python3 "${ROOT}/bin/vdj-set-nv-audio.py" 2>/dev/null || python3 "$HOME/bin/vdj-set-nv-audio.py" 2>/dev/null || true
 
 kill_by_pidfile() {
   local pf="$1"
@@ -87,177 +74,176 @@ kill_by_pidfile() {
   local pid
   pid=$(cat "$pf" 2>/dev/null || true)
   if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-    log "Graceful stop pid $pid from $pf (splash blank + facade teardown)"
-    # TERM → blank_lcds(open/splash) + patchbay.close + USB reattach.
-    # Need several seconds so splash can finish before -9.
+    log "TERM nv-screens pid $pid (clear + release bulk + stock re-enum)"
     kill -TERM "$pid" 2>/dev/null || true
     local i
-    for i in $(seq 1 20); do
+    # Host now runs authorized re-enum itself (~8–12s with sleeps)
+    for i in $(seq 1 40); do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.4
     done
     if kill -0 "$pid" 2>/dev/null; then
-      log "Force kill $pid after graceful wait"
+      log "KILL -9 pid $pid (stock re-enum may still run below)"
       kill -9 "$pid" 2>/dev/null || true
-    else
-      log "nv-screens exited cleanly after blank"
+      sleep 0.5
     fi
   fi
   rm -f "$pf"
 }
 
-# --- HARD kill every nv-screens / guard instance (desktop icon = clean slate) ---
+force_logo_rebind() {
+  log "USB authorized re-enum for stock firmware logos"
+  if [[ -x "$USB_RESET" ]]; then
+    if sudo -n "$USB_RESET" >>"$LOG" 2>&1; then
+      log "usb-reset OK — stock logos"
+      return 0
+    fi
+    log "WARN sudo -n $USB_RESET failed (check sudoers NOPASSWD)"
+  fi
+  return 1
+}
+
+nv_midi_present() {
+  aconnect -l 2>/dev/null | grep -q 'NV Graphics' \
+    && aconnect -l 2>/dev/null | grep -q 'NV Audio'
+}
+
 kill_old_nv_screens() {
-  log "Killing previous nv-screens / graphics_guard"
+  # $1 = --exit  → full logo re-enum after VDJ quits (clean shutdown)
+  # default      → startup cleanup; skip re-enum if devices already healthy
+  local mode="${1:-}"
+  log "Stopping nv-screens / leftover paint tools (mode=${mode:-start})"
+  local had_host=0
+  if [[ -f "$NV_PIDFILE" ]]; then
+    local pid
+    pid=$(cat "$NV_PIDFILE" 2>/dev/null || true)
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      had_host=1
+    fi
+  fi
   kill_by_pidfile "$NV_PIDFILE"
-  kill_by_pidfile "$GUARD_PIDFILE"
   local p
-  for p in $(ps -eo pid=,cmd= | awk -v s="$NV_SCRIPT" 'index($0, s) && $0 !~ /awk/ {print $1}'); do
-    log "  kill leftover nv_screens $p"
-    kill -9 "$p" 2>/dev/null || true
-  done
-  for p in $(ps -eo pid=,cmd= | awk '/tools2\/nv_screens\.py/ && !/awk/ {print $1}'); do
-    kill -9 "$p" 2>/dev/null || true
-  done
   for p in $(ps -eo pid=,cmd= | awk '/graphics_guard\.sh/ && !/awk/ {print $1}'); do
-    log "  kill leftover guard $p"
     kill -9 "$p" 2>/dev/null || true
+    had_host=1
   done
-  # give USB a moment to release after libusb claim
-  sleep 1.2
-  log "nv-screens kill complete"
+  for p in $(ps -eo pid=,cmd= | awk -v s="$NV_SCRIPT" 'index($0, s) && $0 !~ /awk/ {print $1}'); do
+    kill -9 "$p" 2>/dev/null || true
+    had_host=1
+  done
+  sleep 0.3
+
+  if [[ "$mode" == "--exit" ]]; then
+    # Clean shutdown: host may already re-enum; rebind if logos needed
+    force_logo_rebind || true
+    log "stop complete (exit)"
+    return 0
+  fi
+
+  # STARTUP: do NOT always wipe+re-enum (that was ~15–25s before Wine).
+  # After a clean previous exit, Audio/Graphics are already present.
+  if [[ "$had_host" -eq 1 ]]; then
+    if nv_midi_present; then
+      log "skip startup re-enum — NV Audio/Graphics already present"
+    else
+      log "NV MIDI missing after killing host — re-enum"
+      force_logo_rebind || true
+    fi
+  else
+    if nv_midi_present; then
+      log "skip startup re-enum — no prior host, devices OK"
+    else
+      log "NV MIDI missing at start — re-enum"
+      force_logo_rebind || true
+    fi
+  fi
+  log "stop complete (start)"
 }
 
 start_nv_screens() {
-  export NV_FACADE_NAME_MODE="${NV_FACADE_NAME_MODE:-factory}"
-  if [[ -x "$ROOT/tools/clear-vdj-midi-clutter.sh" ]]; then
-    bash "$ROOT/tools/clear-vdj-midi-clutter.sh" >>"$LOG" 2>&1 || true
+  if [[ -x "$ROOT/scripts/clear-vdj-midi-clutter.sh" ]]; then
+    bash "$ROOT/scripts/clear-vdj-midi-clutter.sh" >>"$LOG" 2>&1 || true
   fi
-
-  log "Starting nv-screens facade_names=$NV_FACADE_NAME_MODE"
+  log "Starting nv-screens (host, not bwrap)"
   : >"$NV_LOG"
-
-  # open = splash only (0506/0508/0530); live-only = VDJ SysEx paint
-  local wake="${NV_WAKE_MODE:-open}"
-  local extra=(
-    --patchbay --no-wait --live-only
-    --idle-after-vdj-s 2
-    --wake-mode "$wake"
-  )
-  log "live-only + wake=$wake"
-
-  nohup python3 -u "$NV_SCRIPT" "${extra[@]}" >>"$NV_LOG" 2>&1 &
+  : >"$BRIDGE_LOG"
+  : >"$CSV_LOG"
+  nohup python3 -u "$NV_SCRIPT" \
+    --patchbay --no-wait --live-only \
+    --idle-after-vdj-s 2 \
+    --wake-mode open \
+    --csv-log "$CSV_LOG" --vdj-csv "$CSV_LOG" \
+    >>"$NV_LOG" 2>&1 &
   echo $! >"$NV_PIDFILE"
   log "nv-screens pid=$(cat "$NV_PIDFILE")"
 }
 
 wait_for_nv_client() {
   local i
-  for i in $(seq 1 50); do
-    if aconnect -l 2>/dev/null | grep -q "nv-screens"; then
-      return 0
-    fi
-    sleep 0.2
+  for i in $(seq 1 40); do
+    aconnect -l 2>/dev/null | grep -q "nv-screens" && return 0
+    sleep 0.25
   done
   return 1
 }
 
-wait_for_graphics_claimed() {
+wire_once() {
+  # Single wire pass — no 3× retry thrash
   local i
-  for i in $(seq 1 50); do
-    if grep -q "claimed 15e4:2033" "$NV_LOG" 2>/dev/null; then
-      log "Graphics claimed via libusb"
-      return 0
-    fi
-    if ! amidi -l 2>/dev/null | grep -qi "Graphics"; then
-      log "Graphics gone from amidi"
-      return 0
-    fi
-    sleep 0.2
-  done
-  log "WARN: Graphics claim not confirmed"
-  return 1
-}
-
-wire_routes() {
-  if ! wait_for_nv_client; then
-    log "ERROR: nv-screens ALSA client missing"
-    return 1
-  fi
-  local i
-  for i in $(seq 1 180); do
+  for i in $(seq 1 60); do
     if aconnect -l 2>/dev/null | grep -q "WINE midi driver"; then
-      break
+      log "Wine MIDI up — wire once"
+      bash "$WIRE_SCRIPT" >>"$LOG" 2>&1 || log "wire failed"
+      return 0
     fi
-    sleep 0.4
+    sleep 0.5
   done
-  if ! aconnect -l 2>/dev/null | grep -q "WINE midi driver"; then
-    log "ERROR: Wine MIDI never appeared"
-    return 1
-  fi
-  log "Wiring Wine ⟷ Control/Audio; Wine → vdj_in; isolate Graphics"
-  bash "$WIRE_SCRIPT" >>"$LOG" 2>&1 || log "wire_hybrid failed"
-  bash "$GUARD_SCRIPT" --once >>"$LOG" 2>&1 || true
+  log "WARN Wine MIDI never appeared for wire"
+  return 1
 }
 
-# ========== DESKTOP ICON SEQUENCE ==========
+run_wine() {
+  if [[ -z "${NV_SKIP_WINEALSA_BWRAP:-}" && -f "$_NV_SO" && -x /usr/bin/bwrap ]]; then
+    log "Wine under bwrap (winealsa only)"
+    /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
+      wine "$EXE" "$@"
+  else
+    wine "$EXE" "$@"
+  fi
+}
+
+# ========== LAUNCH ==========
 kill_old_nv_screens
 start_nv_screens
 
 if ! wait_for_nv_client; then
-  echo "nv-screens failed to start — see $NV_LOG" >&2
-  tail -20 "$NV_LOG" >&2 || true
+  echo "nv-screens failed — see $NV_LOG" >&2
+  tail -40 "$NV_LOG" >&2 || true
   exit 1
 fi
-wait_for_graphics_claimed || true
 
-if [[ -x "$GUARD_SCRIPT" ]]; then
-  nohup bash "$GUARD_SCRIPT" >>"$LOG" 2>&1 &
-  echo $! >"$GUARD_PIDFILE"
-  log "graphics_guard pid=$(cat "$GUARD_PIDFILE")"
-fi
-
-# Point VDJ audio at current NV Audio card (card index moves after hybrid claim)
 if [[ -x "$HOME/bin/vdj-set-nv-audio.py" ]]; then
-  python3 "$HOME/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || true
+  python3 "${ROOT}/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || python3 "$HOME/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || true
 fi
-# Ensure Wine uses alsa backend (USB VID/PID from card usbid for NUMARK NV button)
 wine reg add 'HKCU\Software\Wine\Drivers' /v Audio /t REG_SZ /d alsa /f >/dev/null 2>&1 || true
-bash "$ROOT/tools/apply-nv-spoof.sh" >>"$LOG" 2>&1 || true
+bash "$ROOT/scripts/apply-nv-spoof.sh" >>"$LOG" 2>&1 || true
 
-(
-  # Wait for Wine MIDI, then wire a few times only (avoid connect/disconnect thrash)
-  for i in $(seq 1 40); do
-    if aconnect -l 2>/dev/null | grep -q "WINE midi driver"; then
-      break
-    fi
-    sleep 0.5
-  done
-  if wire_routes; then
-    log "Initial wire OK"
-  fi
-  for _ in 1 2 3; do
-    sleep 3
-    if aconnect -l 2>/dev/null | grep -q "WINE midi driver"; then
-      bash "$WIRE_SCRIPT" >>"$LOG" 2>&1 || true
-      bash "$GUARD_SCRIPT" --once >>"$LOG" 2>&1 || true
-    fi
-  done
-  log "Wire retries done"
-) &
+# Wire in background once Wine appears — no re-wire loop
+wire_once &
 
 echo "=============================================="
-echo "  VirtualDJ + Numark NV (factory Controllers + live LCDs)"
+echo "  VirtualDJ + Numark NV"
 echo "=============================================="
-echo "  wake=${NV_WAKE_MODE:-open}  log=$NV_LOG"
+echo "  Wake:  raw bulk open+empty"
+echo "  Paint: live VDJ"
+echo "  Close: release host → USB authorized re-enum → logos"
+echo "  Log:   $NV_LOG"
 echo "=============================================="
 
-# Do not exec-replace: when VDJ/wine exits, tear down facade + guard so
-# qpwgraph/patchbay does not keep 129:nv-screens-facade-midi forever.
 set +e
-wine "$EXE" "$@"
+run_wine "$@"
 rc=$?
 set -e
-log "Wine/VDJ exited rc=$rc — cleaning nv-screens"
-kill_old_nv_screens
+log "Wine exited rc=$rc"
+kill_old_nv_screens --exit
 exit "$rc"

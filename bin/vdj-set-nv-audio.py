@@ -98,7 +98,7 @@ text2 = re.sub(
 devices = settings.parent / "Devices"
 devices.mkdir(parents=True, exist_ok=True)
 audio_xml = devices / "Numark_NV_Audio.xml"
-repo = home / "src/nv-screens/tools/vdj-devices/Numark_NV_Audio.xml"
+repo = home / "src/nv-screens/config/vdj-devices/Numark_NV_Audio.xml"
 if repo.exists():
     audio_xml.write_text(repo.read_text(encoding="utf-8"), encoding="utf-8")
 
