@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.1 — 2026-08-04
+
+Patch release: Left LCD browser list stability.
+
+### Fixed
+- **Left LCD browser twitch / double-row highlight** — selection “blip” between the grey highlighted track and the row below. Caused by guessing reverse scroll on highlight-only strip updates (Right was usually fine because it gets cleaner full 0..6 frames).
+- **MIDI browse inject spam** — false-positive LED blink detection was injecting net-zero browse CCs many times per second (`+1` then `-1`), twitching the list selection on both software and LCD. Inject is **off by default**; set `NV_MOUSE_LIBRARY_INJECT=1` only if you want experimental mouse→library open.
+- Browser assembler: confident strip-0 scroll only; mid-list highlight updates that strip without rebuilding a bad full frame.
+
+### Upgrade
+```bash
+git pull
+# restart host / start-virtualdj.sh
+```
+
+---
+
 ## 1.1.0 — 2026-08-04
 
 Second public release. Builds on **v1.0.0** (factory Controllers + live dual LCD under Wine).
@@ -19,7 +36,7 @@ Second public release. Builds on **v1.0.0** (factory Controllers + live dual LCD
 **LCD / browser**  
 - Cleaner browser list scrolling on both LCDs (full 0..6 frames + careful strip-0 scroll)  
 - After LOAD, waveforms stay protected; residual browser paint doesn’t blank the deck  
-- **Mouse → library on the LCD**: focusing the software track list (song pane) can open Library View. Stock VDJ only paints the list after SEL/browse; the host detects song/folders focus and injects a net-zero browse pulse so the definition paints the current selection  
+- Optional mouse → library open (see 1.1.1: off by default via `NV_MOUSE_LIBRARY_INJECT`)  
 - Pane title / list chrome (`0521`–`0524`) prioritised in the live queue  
 
 **Startup / shutdown**  

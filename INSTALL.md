@@ -1,6 +1,6 @@
 # Easy install guide
 
-**Numark NV + VirtualDJ on Linux** (v1.1.0)
+**Numark NV + VirtualDJ on Linux** (v1.1.1)
 
 Get dual LCDs + Controllers working with VirtualDJ under Wine.  
 No Windows required on the host PC.

@@ -1,6 +1,6 @@
 # Numark NV + VirtualDJ on Linux
 
-**v1.1.0** — Dual 4.3″ LCDs and factory Controllers under Wine VirtualDJ.
+**v1.1.1** — Dual 4.3″ LCDs and factory Controllers under Wine VirtualDJ.
 
 Linux already exposes the NV as class-compliant USB-MIDI and audio. This project
 provides the missing **display paint path** (private SysEx → USB-MIDI bulk) so
@@ -60,14 +60,10 @@ start-virtualdj.sh
 
 `install.sh` copies into `~/src/nv-screens` by default and links `~/bin/start-virtualdj.sh`.
 
-## What’s new in 1.1.0
+## What’s new
 
-- Clean package layout (no more `tools2` / `src2`)
-- Smoother browser scrolling on both LCDs
-- Mouse focus on the software track list can open **Library View** on the LCD
-  (VDJ only paints the list after browse activity — the host bridges that gap)
-- Faster restart when devices are already present
-- Safer close path
+**1.1.1** — Left LCD browser highlight/twitch fix; browse inject off by default.  
+**1.1.0** — Clean package layout, dual LCD live paint, Controllers under Wine.
 
 See [CHANGELOG.md](CHANGELOG.md).
 

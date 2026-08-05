@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Numark NV + VirtualDJ on Linux — installer (v1.1.0)
+# Numark NV + VirtualDJ on Linux — installer (v1.1.1)
 set -euo pipefail
 
 if [[ -t 1 ]]; then
@@ -19,7 +19,7 @@ MISSING=()
 
 cat <<'BANNER'
 
-  Numark NV  +  VirtualDJ  on  Linux   (v1.1.0)
+  Numark NV  +  VirtualDJ  on  Linux   (v1.1.1)
   Dual LCD + Controllers under Wine
 
 BANNER
