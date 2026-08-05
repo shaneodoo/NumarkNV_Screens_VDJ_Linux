@@ -1,6 +1,6 @@
 # Numark NV + VirtualDJ on Linux
 
-**v1.1.1** — Dual 4.3″ LCDs and factory Controllers under Wine VirtualDJ.
+**v1.1.2** — Dual 4.3″ LCDs and factory Controllers under Wine VirtualDJ.
 
 Linux already exposes the NV as class-compliant USB-MIDI and audio. This project
 provides the missing **display paint path** (private SysEx → USB-MIDI bulk) so
@@ -49,7 +49,20 @@ python3 bin/nv-screens --patchbay --live-only --wake-mode open --no-wait
 
 ## Install
 
-**→ Step-by-step:** **[INSTALL.md](INSTALL.md)** (easy install guide)
+**→ Step-by-step:** **[INSTALL.md](INSTALL.md)**
+
+### Flatpak (glue only — you already have Wine + VirtualDJ)
+
+```bash
+./flatpak/build.sh
+flatpak install --user -y ./flatpak/nv-screens.flatpak
+flatpak run io.github.shaneodoo.NvScreens --install-udev   # once
+flatpak run io.github.shaneodoo.NvScreens                  # daily
+```
+
+Details: [flatpak/README.md](flatpak/README.md).
+
+### Classic (git)
 
 ```bash
 git clone https://github.com/shaneodoo/NumarkNV_Screens_VDJ_Linux.git
@@ -62,6 +75,7 @@ start-virtualdj.sh
 
 ## What’s new
 
+**1.1.2** — Multi-user safe logs (`~/.local/state/nv-screens/`), absolute desktop/launcher paths.  
 **1.1.1** — Left LCD browser highlight/twitch fix; browse inject off by default.  
 **1.1.0** — Clean package layout, dual LCD live paint, Controllers under Wine.
 

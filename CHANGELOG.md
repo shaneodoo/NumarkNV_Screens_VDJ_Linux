@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.1.2 — 2026-08-05
+
+End-user install polish: multi-user safe launcher + reliable desktop icon.
+
+### Fixed
+- **Permission denied on launch (shared `/tmp` logs)** — `start-virtualdj.sh` wrote `/tmp/nv-*.log` mode 644 owned by the first user; a second account hit `Permission denied` at the first log line. Logs now live under `~/.local/state/nv-screens/` (per user).
+- **App menu / desktop icon pointing at the wrong tree** — installer always installs a thin wrapper with **absolute** `ROOT` and a `.desktop` with absolute `Exec=`, `TryExec=`, and `Path=`.
+- **Shane-specific media mount** — removed hardcoded `/mnt/shane1`; optional `NV_DJ_MOUNT` if you want a D: drive.
+- **winealsa bind path** — probes common distro paths instead of only Fedora `/usr/lib64/wine-wow64/...`.
+
+### Installer
+- Always bakes absolute paths (no “only when DEST ≠ default” sed).
+- Clearer PATH warning when `~/bin` is not on `$PATH`.
+- `NV_INSTALL_YES=1` for non-interactive install; `NV_INSTALL_ROOT` / `NV_BIN_DIR` still supported.
+- Logs path printed at end of install.
+
+### Upgrade
+```bash
+git pull
+./install.sh
+# then re-test as any user:  ~/bin/start-virtualdj.sh
+```
+
+---
+
 ## 1.1.1 — 2026-08-04
 
 Patch release: Left LCD browser list stability.

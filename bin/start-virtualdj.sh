@@ -6,9 +6,44 @@
 # - wire Wine once (no retry thrash in qpwgraph)
 # - on exit: stop host → authorized 0→1 hub re-enum → firmware logos
 #
+# Multi-user safe: logs live under ~/.local/state/nv-screens (not /tmp).
+# ROOT auto-detects from this script's location when installed in-tree.
+#
 set -euo pipefail
 
-ROOT="${ROOT:-$HOME/src/nv-screens}"
+# ---------- resolve ROOT ----------
+# 1) env ROOT (set by install wrapper / Flatpak)
+# 2) this script lives in <tree>/bin/ → parent is ROOT
+# 3) fallback ~/src/nv-screens
+_resolve_root() {
+  local here parent
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  parent="$(cd "$here/.." && pwd)"
+  if [[ -x "$here/nv-screens" && -d "$parent/nv_screens" ]]; then
+    echo "$parent"
+    return
+  fi
+  if [[ -x "$here/bin/nv-screens" && -d "$here/nv_screens" ]]; then
+    echo "$here"
+    return
+  fi
+  echo "${HOME}/src/nv-screens"
+}
+
+if [[ -z "${ROOT:-}" ]]; then
+  ROOT="$(_resolve_root)"
+fi
+export ROOT
+
+if [[ ! -x "$ROOT/bin/nv-screens" ]]; then
+  echo "ERROR: nv-screens not found at $ROOT/bin/nv-screens" >&2
+  echo "  Re-run the installer from the git checkout:" >&2
+  echo "    ./install.sh" >&2
+  echo "  Or set ROOT to your install folder:" >&2
+  echo "    ROOT=/path/to/nv-screens start-virtualdj.sh" >&2
+  exit 1
+fi
+
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
 export WINEPREFIX
 export WINEESYNC="${WINEESYNC:-1}"
@@ -17,33 +52,53 @@ export WINEDEBUG="${WINEDEBUG:--d2d,-dwrite,-font}"
 export NV_FACADE_NAME_MODE="${NV_FACADE_NAME_MODE:-factory}"
 
 _NV_SO="$ROOT/wine-patch/x86_64-unix/winealsa.so"
-_NV_DST="/usr/lib64/wine-wow64/wine/x86_64-unix/winealsa.so"
+# Common distro locations for winealsa.so (bind-over only if file exists)
+_NV_DST=""
+for _cand in \
+  "/usr/lib64/wine-wow64/wine/x86_64-unix/winealsa.so" \
+  "/usr/lib64/wine/x86_64-unix/winealsa.so" \
+  "/usr/lib/wine/x86_64-unix/winealsa.so" \
+  "/usr/lib/x86_64-linux-gnu/wine/x86_64-unix/winealsa.so"
+do
+  if [[ -e "$_cand" ]]; then
+    _NV_DST="$_cand"
+    break
+  fi
+done
 
 DOS="$WINEPREFIX/dosdevices"
 VDJ_SETTINGS="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/settings.xml"
-MOUNT="/mnt/shane1"
 EXE="$WINEPREFIX/drive_c/Program Files/VirtualDJ/virtualdj.exe"
+# Optional DJ media mount — set NV_DJ_MOUNT or leave unset (no shane-specific paths)
+MOUNT="${NV_DJ_MOUNT:-}"
 
-LOG="/tmp/nv-midi-connect.log"
-NV_LOG="/tmp/nv-screens-live.log"
-NV_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/nv-screens.pid"
+# Per-user state (never share /tmp logs across accounts)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nv-screens"
+mkdir -p "$STATE_DIR" "$HOME/bin" "$ROOT/captures" 2>/dev/null || true
+LOG="${NV_CONNECT_LOG:-$STATE_DIR/midi-connect.log}"
+NV_LOG="${NV_SCREENS_LOG:-$STATE_DIR/screens-live.log}"
+NV_PIDFILE="${XDG_RUNTIME_DIR:-$STATE_DIR}/nv-screens.pid"
 NV_SCRIPT="$ROOT/bin/nv-screens"
 WIRE_SCRIPT="$ROOT/scripts/wire_hybrid.sh"
 USB_RESET="$ROOT/scripts/usb-reset-nv.sh"
-CSV_LOG="$ROOT/captures/vdj-from-wine-live.csv"
-BRIDGE_LOG="$ROOT/captures/live-bridge.txt"
+CSV_LOG="$STATE_DIR/vdj-from-wine-live.csv"
+BRIDGE_LOG="$STATE_DIR/live-bridge.txt"
 
-mkdir -p "$HOME/bin" "$ROOT/captures"
-echo "$(date -Is) === desktop launch ===" >>"$LOG"
-log() { echo "$(date -Is) $*" >>"$LOG"; }
+# Ensure we can write logs (create empty files we own)
+: >>"$LOG" 2>/dev/null || LOG="$STATE_DIR/midi-connect.log"
+: >>"$LOG" || true
 
-if [[ -d "$MOUNT/DJ" ]]; then
-  ln -sfn "$MOUNT" "$DOS/d:"
-  [[ -b /dev/sdb1 ]] && ln -sfn /dev/sdb1 "$DOS/d::" || true
-  ln -sfn "$MOUNT/DJ" "$HOME/Music/DJ" || true
+log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
+log "=== desktop launch === ROOT=$ROOT user=$USER"
+
+if [[ -n "$MOUNT" && -d "$MOUNT/DJ" ]]; then
+  ln -sfn "$MOUNT" "$DOS/d:" 2>/dev/null || true
+  ln -sfn "$MOUNT/DJ" "$HOME/Music/DJ" 2>/dev/null || true
 fi
-ln -sfn "$HOME" "$DOS/z:"
-rm -f "$DOS/j:" "$DOS/j::" "$DOS/y:" 2>/dev/null || true
+if [[ -d "$DOS" ]]; then
+  ln -sfn "$HOME" "$DOS/z:" 2>/dev/null || true
+  rm -f "$DOS/j:" "$DOS/j::" "$DOS/y:" 2>/dev/null || true
+fi
 
 if [[ -f "$VDJ_SETTINGS" ]]; then
   python3 - "$VDJ_SETTINGS" <<'PY' || true
@@ -64,9 +119,11 @@ PY
 fi
 
 FAV="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/Folders/DJ.vdjfolder"
-mkdir -p "$(dirname "$FAV")"
-printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<FavoriteFolder path="D:\DJ" />' > "$FAV"
-python3 "${ROOT}/bin/vdj-set-nv-audio.py" 2>/dev/null || python3 "$HOME/bin/vdj-set-nv-audio.py" 2>/dev/null || true
+if [[ -d "$WINEPREFIX" ]]; then
+  mkdir -p "$(dirname "$FAV")" 2>/dev/null || true
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<FavoriteFolder path="D:\DJ" />' > "$FAV" 2>/dev/null || true
+fi
+python3 "${ROOT}/bin/vdj-set-nv-audio.py" 2>/dev/null || true
 
 kill_by_pidfile() {
   local pf="$1"
@@ -203,11 +260,16 @@ wire_once() {
 }
 
 run_wine() {
-  if [[ -z "${NV_SKIP_WINEALSA_BWRAP:-}" && -f "$_NV_SO" && -x /usr/bin/bwrap ]]; then
-    log "Wine under bwrap (winealsa only)"
+  if [[ -z "${NV_SKIP_WINEALSA_BWRAP:-}" && -f "$_NV_SO" && -n "$_NV_DST" && -x /usr/bin/bwrap ]]; then
+    log "Wine under bwrap (winealsa only → $_NV_DST)"
     /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
       wine "$EXE" "$@"
   else
+    if [[ ! -f "$_NV_SO" ]]; then
+      log "WARN winealsa.so patch missing at $_NV_SO — running plain wine"
+    elif [[ -z "$_NV_DST" ]]; then
+      log "WARN system winealsa.so not found — running plain wine"
+    fi
     wine "$EXE" "$@"
   fi
 }
@@ -218,13 +280,11 @@ start_nv_screens
 
 if ! wait_for_nv_client; then
   echo "nv-screens failed — see $NV_LOG" >&2
-  tail -40 "$NV_LOG" >&2 || true
+  tail -40 "$NV_LOG" 2>/dev/null >&2 || true
   exit 1
 fi
 
-if [[ -x "$HOME/bin/vdj-set-nv-audio.py" ]]; then
-  python3 "${ROOT}/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || python3 "$HOME/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || true
-fi
+python3 "${ROOT}/bin/vdj-set-nv-audio.py" >>"$LOG" 2>&1 || true
 wine reg add 'HKCU\Software\Wine\Drivers' /v Audio /t REG_SZ /d alsa /f >/dev/null 2>&1 || true
 bash "$ROOT/scripts/apply-nv-spoof.sh" >>"$LOG" 2>&1 || true
 
@@ -234,11 +294,18 @@ wire_once &
 echo "=============================================="
 echo "  VirtualDJ + Numark NV"
 echo "=============================================="
+echo "  Root:  $ROOT"
 echo "  Wake:  raw bulk open+empty"
 echo "  Paint: live VDJ"
 echo "  Close: release host → USB authorized re-enum → logos"
 echo "  Log:   $NV_LOG"
 echo "=============================================="
+
+if [[ ! -f "$EXE" ]]; then
+  echo "WARNING: VirtualDJ not found at:" >&2
+  echo "  $EXE" >&2
+  echo "  Install the Windows VirtualDJ build under Wine first." >&2
+fi
 
 set +e
 run_wine "$@"

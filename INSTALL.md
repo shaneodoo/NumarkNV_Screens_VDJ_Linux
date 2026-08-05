@@ -1,11 +1,35 @@
 # Easy install guide
 
-**Numark NV + VirtualDJ on Linux** (v1.1.1)
+**Numark NV + VirtualDJ on Linux** (v1.1.2)
 
 Get dual LCDs + Controllers working with VirtualDJ under Wine.  
 No Windows required on the host PC.
 
 ---
+
+## Option A — Flatpak (glue only)
+
+Installs the NV screens host + launcher. **Does not include Wine or VirtualDJ**
+(install those on the host yourself).
+
+```bash
+# Build once (from this repo)
+./flatpak/build.sh
+flatpak install --user -y ./flatpak/nv-screens.flatpak
+
+# One-time USB permissions
+flatpak run io.github.shaneodoo.NvScreens --install-udev
+# unplug/replug Numark NV
+
+# Everyday
+flatpak run io.github.shaneodoo.NvScreens
+```
+
+See [flatpak/README.md](flatpak/README.md).
+
+---
+
+## Option B — Classic install from git
 
 ## What you need
 
@@ -212,7 +236,7 @@ Look for `nv-screens` and `nv-screens-facade-midi`.
 |--------|-----|
 | Start session | `start-virtualdj.sh` or app menu |
 | Stop session | Quit VirtualDJ as usual |
-| Logs (if something fails) | `/tmp/nv-screens-live.log` and `/tmp/nv-midi-connect.log` |
+| Logs (if something fails) | `~/.local/state/nv-screens/screens-live.log` and `midi-connect.log` |
 
 ---
 
@@ -232,12 +256,14 @@ Paths changed (`tools2`/`src2` → `bin`/`nv_screens`/`scripts`). The installer 
 
 | Problem | Try this |
 |---------|----------|
-| Screens stay on logo | Is `nv-screens` running? Check `/tmp/nv-screens-live.log`. Unplug/replug NV, run `start-virtualdj.sh` again. |
+| Screens stay on logo | Is `nv-screens` running? Check `~/.local/state/nv-screens/screens-live.log`. Unplug/replug NV, run `start-virtualdj.sh` again. |
 | No Controllers in VDJ | Host must be up **before** or with the launcher; check `aconnect -l` for facade ports. |
 | No sound | Config → Audio → NV Audio / correct Wine ALSA device. |
 | “Permission denied” USB | Step 5 (udev), replug NV. |
+| “Permission denied” on start / line near logs | Fixed in **v1.1.2** — do not use shared `/tmp/nv-*.log`. Pull latest, re-run `./install.sh`. Logs are per-user under `~/.local/state/nv-screens/`. |
+| App menu does nothing / wrong path | Re-run `./install.sh` (writes absolute `Exec=` + `Path=`). Or run `~/bin/start-virtualdj.sh` in a terminal to see errors. |
 | Logos not restoring | Step 6 (sudoers). Manual: `sudo ~/src/nv-screens/scripts/usb-reset-nv.sh` |
-| Mouse list not on LCD | Restart VDJ once; use browse knob once; ensure Custom Mapping is selected. |
+| Mouse list not on LCD | Restart VDJ once; use browse knobs once; ensure Custom Mapping is selected. |
 
 More detail: [docs/HYBRID-DAILY.md](docs/HYBRID-DAILY.md), [docs/SYSTEM-PICTURE.md](docs/SYSTEM-PICTURE.md).
 

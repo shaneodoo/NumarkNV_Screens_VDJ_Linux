@@ -44,8 +44,8 @@ Double-click **VirtualDJ** desktop icon → runs `~/bin/start-virtualdj.sh`.
 
 | File | What |
 |------|------|
-| `/tmp/nv-screens-live.log` | Painter / bridge |
-| `/tmp/nv-midi-connect.log` | Wire + guard |
+| `~/.local/state/nv-screens/screens-live.log` | Painter / bridge |
+| `~/.local/state/nv-screens/midi-connect.log` | Wire + guard |
 
 ## Honest note (Wine)
 

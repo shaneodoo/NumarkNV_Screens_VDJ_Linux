@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Numark NV + VirtualDJ on Linux — installer (v1.1.1)
+# Numark NV + VirtualDJ on Linux — installer (v1.1.2)
+# Multi-user safe: absolute paths, per-user desktop, no shared /tmp logs.
 set -euo pipefail
 
 if [[ -t 1 ]]; then
@@ -15,21 +16,38 @@ step() { echo -e "\n${B}[$1]${N} $2"; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="${NV_INSTALL_ROOT:-$HOME/src/nv-screens}"
 BIN="${NV_BIN_DIR:-$HOME/bin}"
+# Expand ~ and make absolute
+DEST="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$DEST")"
+BIN="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$BIN")"
 MISSING=()
+AUTO_YES="${NV_INSTALL_YES:-}"
+
+ask_yn() {
+  # $1 prompt  $2 default Y|N
+  local prompt="$1" def="${2:-Y}" ans
+  if [[ -n "$AUTO_YES" ]]; then
+    [[ "$AUTO_YES" =~ ^[Yy1] ]] && return 0 || return 1
+  fi
+  if [[ ! -t 0 ]]; then
+    [[ "$def" == "Y" ]] && return 0 || return 1
+  fi
+  read -r -p "  $prompt" ans
+  ans=${ans:-$def}
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
 
 cat <<'BANNER'
 
-  Numark NV  +  VirtualDJ  on  Linux   (v1.1.1)
+  Numark NV  +  VirtualDJ  on  Linux   (v1.1.2)
   Dual LCD + Controllers under Wine
 
 BANNER
 
 echo "  Install folder: ${B}$DEST${N}"
-echo "  Shortcuts:      ${B}$BIN/start-virtualdj.sh${N}"
+echo "  Launcher:       ${B}$BIN/start-virtualdj.sh${N}"
+echo "  App menu:       VirtualDJ (Numark NV)"
 echo
-read -r -p "  Ready? [Y/n] " ans
-ans=${ans:-Y}
-if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+if ! ask_yn "Ready? [Y/n] " Y; then
   echo "  Cancelled."
   exit 0
 fi
@@ -54,9 +72,12 @@ if ((${#MISSING[@]} > 0)); then
     echo -e "    ${B}sudo dnf install wine python3-pyusb bubblewrap alsa-utils${N}"
   elif have apt; then
     echo -e "    ${B}sudo apt install wine python3-pyusb bubblewrap alsa-utils${N}"
+  elif have pacman; then
+    echo -e "    ${B}sudo pacman -S wine python-pyusb bubblewrap alsa-utils${N}"
   fi
-  read -r -p "  Continue anyway? [y/N] " ans
-  [[ "${ans:-N}" =~ ^[Yy]$ ]] || exit 1
+  if ! ask_yn "Continue anyway? [y/N] " N; then
+    exit 1
+  fi
 fi
 
 step 2/5 "Installing tree → $DEST"
@@ -68,60 +89,102 @@ if [[ "$SRC" != "$DEST" ]]; then
     cp -a "$SRC/$d" "$DEST/"
     ok "copied $d"
   done
-  # sudoers-compat wrappers
   if [[ -d "$SRC/tools" ]]; then
     rm -rf "$DEST/tools"
     cp -a "$SRC/tools" "$DEST/"
   fi
-  for f in README.md LICENSE VERSION CHANGELOG.md install.sh; do
+  for f in README.md LICENSE VERSION CHANGELOG.md INSTALL.md install.sh; do
     [[ -f "$SRC/$f" ]] && cp -a "$SRC/$f" "$DEST/"
   done
 else
   ok "Already in place at $DEST"
 fi
 
-step 3/5 "Shortcuts in $BIN"
-install -m 0755 "$DEST/bin/start-virtualdj.sh" "$BIN/start-virtualdj.sh"
-install -m 0755 "$DEST/bin/vdj-set-nv-audio.py" "$BIN/vdj-set-nv-audio.py"
-if [[ "$DEST" != "$HOME/src/nv-screens" ]]; then
-  sed -i "s|ROOT=\"\${ROOT:-\$HOME/src/nv-screens}\"|ROOT=\"\${ROOT:-$DEST}\"|" \
-    "$BIN/start-virtualdj.sh"
-fi
-ok "start-virtualdj.sh"
+# Ensure scripts are executable
+chmod +x "$DEST/bin/start-virtualdj.sh" "$DEST/bin/nv-screens" 2>/dev/null || true
+find "$DEST/bin" "$DEST/scripts" "$DEST/tools" -type f 2>/dev/null | while read -r f; do
+  head -1 "$f" 2>/dev/null | grep -q '^#!' && chmod +x "$f" || true
+done
 
-mkdir -p "$HOME/.local/share/applications"
-cat > "$HOME/.local/share/applications/numark-nv-virtualdj.desktop" <<EOF
+step 3/5 "Shortcuts in $BIN"
+# Thin wrapper with absolute path — works from PATH / desktop / cron
+cat > "$BIN/start-virtualdj.sh" <<WRAP
+#!/usr/bin/env bash
+# Installed by nv-screens install.sh — do not edit; re-run install.sh to refresh
+export ROOT="$DEST"
+exec "$DEST/bin/start-virtualdj.sh" "\$@"
+WRAP
+chmod 0755 "$BIN/start-virtualdj.sh"
+ok "start-virtualdj.sh → $DEST/bin/start-virtualdj.sh"
+
+install -m 0755 "$DEST/bin/vdj-set-nv-audio.py" "$BIN/vdj-set-nv-audio.py"
+ok "vdj-set-nv-audio.py"
+
+# Desktop entry with absolute Exec + Path (GNOME/KDE/etc.)
+APPS="$HOME/.local/share/applications"
+mkdir -p "$APPS"
+DESKTOP="$APPS/numark-nv-virtualdj.desktop"
+cat > "$DESKTOP" <<EOF
 [Desktop Entry]
+Version=1.0
 Type=Application
 Name=VirtualDJ (Numark NV)
-Comment=Start VirtualDJ with Numark NV screens + controls
+GenericName=DJ Software
+Comment=Start VirtualDJ with Numark NV dual LCDs + controllers
 Exec=$BIN/start-virtualdj.sh
-Icon=wine
+TryExec=$BIN/start-virtualdj.sh
+Path=$DEST
+Icon=audio-headphones
 Terminal=false
-Categories=AudioVideo;Audio;
-Keywords=DJ;Numark;VirtualDJ;NV;
+StartupNotify=true
+Categories=AudioVideo;Audio;Player;
+Keywords=DJ;Numark;VirtualDJ;NV;Wine;
 EOF
-ok "Desktop entry"
+chmod 0644 "$DESKTOP"
+ok "Desktop entry → $DESKTOP"
+
+# Refresh menu caches when tools exist
+if have update-desktop-database; then
+  update-desktop-database "$APPS" 2>/dev/null || true
+fi
+if have gtk-update-icon-cache; then
+  true
+fi
+
+# PATH hint
+case ":$PATH:" in
+  *":$BIN:"*) ok "$BIN is on PATH" ;;
+  *)
+    warn "$BIN is not on PATH yet"
+    echo "    Add to ~/.bashrc:  export PATH=\"$BIN:\$PATH\""
+    echo "    Or always run:     $BIN/start-virtualdj.sh"
+    ;;
+esac
 
 step 4/5 "USB udev rules (optional password)…"
 RULES_SRC="$DEST/config/udev/99-numark-nv.rules"
 if [[ -f "$RULES_SRC" ]]; then
-  if [[ -w /etc/udev/rules.d ]] 2>/dev/null; then
+  if [[ -f /etc/udev/rules.d/99-numark-nv.rules ]]; then
+    ok "udev rules already present"
+  elif [[ -w /etc/udev/rules.d ]] 2>/dev/null; then
     cp -a "$RULES_SRC" /etc/udev/rules.d/99-numark-nv.rules
     udevadm control --reload-rules 2>/dev/null || true
     ok "udev rules installed"
   else
-    echo "  sudo cp $RULES_SRC /etc/udev/rules.d/"
-    echo "  sudo udevadm control --reload-rules && sudo udevadm trigger"
-    read -r -p "  Run with sudo now? [Y/n] " ans
-    ans=${ans:-Y}
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      sudo cp -a "$RULES_SRC" /etc/udev/rules.d/99-numark-nv.rules
-      sudo udevadm control --reload-rules
-      sudo udevadm trigger
-      ok "udev rules installed"
+    echo "  Manual (if needed later):"
+    echo "    sudo cp $RULES_SRC /etc/udev/rules.d/"
+    echo "    sudo udevadm control --reload-rules && sudo udevadm trigger"
+    # Only offer sudo when interactive (password prompt works)
+    if [[ -z "$AUTO_YES" ]] && [[ -t 0 ]] && ask_yn "Run with sudo now? [Y/n] " Y; then
+      if sudo cp -a "$RULES_SRC" /etc/udev/rules.d/99-numark-nv.rules \
+        && sudo udevadm control --reload-rules \
+        && sudo udevadm trigger; then
+        ok "udev rules installed"
+      else
+        warn "sudo udev install failed — run the commands above later"
+      fi
     else
-      warn "Skipped udev — you may need root for USB bulk"
+      warn "Skipped udev for now — you may need root for USB bulk"
     fi
   fi
 fi
@@ -132,9 +195,17 @@ echo "  For passwordless logo restore on VDJ exit, add to sudoers:"
 echo -e "    ${B}$USER ALL=(root) NOPASSWD: $RESET${N}"
 echo "  (compat wrapper still at $DEST/tools/usb-reset-nv.sh)"
 
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nv-screens"
+mkdir -p "$STATE" 2>/dev/null || true
+
 echo
-ok "Install complete — version $(cat "$DEST/VERSION" 2>/dev/null || echo 1.1.0)"
+ok "Install complete — version $(cat "$DEST/VERSION" 2>/dev/null || echo 1.1.2)"
 echo
-echo "  Start with:  ${B}start-virtualdj.sh${N}"
-echo "  or:          ${B}$BIN/start-virtualdj.sh${N}"
+echo "  Start with:"
+echo -e "    ${B}$BIN/start-virtualdj.sh${N}"
+echo "  or app menu:  ${B}VirtualDJ (Numark NV)${N}"
+echo
+echo "  Logs (this user only):"
+echo "    $STATE/screens-live.log"
+echo "    $STATE/midi-connect.log"
 echo
