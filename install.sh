@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install Numark NV + VirtualDJ Linux glue.
-# Absolute paths, per-user desktop and logs.
+# Install VirtualDJ on Linux glue: Numark NV screens + optional DXVK video stack.
+# Absolute paths, per-user desktop and logs. Portable (no host-specific paths).
 set -euo pipefail
 
 if [[ -t 1 ]]; then
@@ -16,14 +16,16 @@ step() { echo -e "\n${B}[$1]${N} $2"; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="${NV_INSTALL_ROOT:-$HOME/src/nv-screens}"
 BIN="${NV_BIN_DIR:-$HOME/bin}"
-# Expand ~ and make absolute
+WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
+export WINEPREFIX
 DEST="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$DEST")"
 BIN="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$BIN")"
 MISSING=()
 AUTO_YES="${NV_INSTALL_YES:-}"
+# Install DXVK video stack by default if present (NV_INSTALL_DXVK=0 to skip)
+INSTALL_DXVK="${NV_INSTALL_DXVK:-1}"
 
 ask_yn() {
-  # $1 prompt  $2 default Y|N
   local prompt="$1" def="${2:-Y}" ans
   if [[ -n "$AUTO_YES" ]]; then
     [[ "$AUTO_YES" =~ ^[Yy1] ]] && return 0 || return 1
@@ -36,15 +38,18 @@ ask_yn() {
   [[ "$ans" =~ ^[Yy]$ ]]
 }
 
-cat <<'BANNER'
+VER="$(cat "$SRC/VERSION" 2>/dev/null || echo 1.2.0)"
 
-  Numark NV  +  VirtualDJ  on  Linux   (v1.1.2)
-  Dual LCD + Controllers under Wine
+cat <<BANNER
+
+  VirtualDJ on Linux  (v${VER})
+  Numark NV dual LCD + controllers + video (DXVK)
 
 BANNER
 
 echo "  Install folder: ${B}$DEST${N}"
 echo "  Launcher:       ${B}$BIN/start-virtualdj.sh${N}"
+echo "  Wine prefix:    ${B}$WINEPREFIX${N}"
 echo "  App menu:       VirtualDJ (Numark NV)"
 echo
 if ! ask_yn "Ready? [Y/n] " Y; then
@@ -52,7 +57,7 @@ if ! ask_yn "Ready? [Y/n] " Y; then
   exit 0
 fi
 
-step 1/5 "Checking dependencies…"
+step 1/6 "Checking dependencies…"
 have() { command -v "$1" >/dev/null 2>&1; }
 
 if have python3; then ok "Python 3"; else bad "Python 3 missing"; MISSING+=("python3"); fi
@@ -62,28 +67,29 @@ else
   bad "PyUSB missing"; MISSING+=("pyusb")
 fi
 if have wine || have wine64; then ok "Wine"; else warn "Wine not found"; MISSING+=("wine"); fi
-if have bwrap; then ok "bubblewrap"; else warn "bubblewrap not found (optional)"; fi
+if have bwrap; then ok "bubblewrap"; else warn "bubblewrap not found (optional winealsa bind)"; fi
 if have aconnect && have amidi; then ok "ALSA MIDI tools"; else warn "alsa-utils recommended"; MISSING+=("alsa-utils"); fi
+if have vulkaninfo; then ok "vulkaninfo present"; else warn "Vulkan tools optional (needed for VDJ video)"; fi
 
 if ((${#MISSING[@]} > 0)); then
   echo
   warn "Missing: ${MISSING[*]}"
   if have dnf; then
-    echo -e "    ${B}sudo dnf install wine python3-pyusb bubblewrap alsa-utils${N}"
+    echo -e "    ${B}sudo dnf install wine python3-pyusb bubblewrap alsa-utils vulkan-tools${N}"
   elif have apt; then
-    echo -e "    ${B}sudo apt install wine python3-pyusb bubblewrap alsa-utils${N}"
+    echo -e "    ${B}sudo apt install wine python3-pyusb bubblewrap alsa-utils vulkan-tools${N}"
   elif have pacman; then
-    echo -e "    ${B}sudo pacman -S wine python-pyusb bubblewrap alsa-utils${N}"
+    echo -e "    ${B}sudo pacman -S wine python-pyusb bubblewrap alsa-utils vulkan-tools${N}"
   fi
   if ! ask_yn "Continue anyway? [y/N] " N; then
     exit 1
   fi
 fi
 
-step 2/5 "Installing tree → $DEST"
+step 2/6 "Installing tree → $DEST"
 mkdir -p "$DEST" "$BIN"
 if [[ "$SRC" != "$DEST" ]]; then
-  for d in bin nv_screens scripts config data wine-patch tools; do
+  for d in bin nv_screens scripts config data wine-patch tools wine-stack; do
     [[ -d "$SRC/$d" ]] || continue
     rm -rf "$DEST/$d"
     cp -a "$SRC/$d" "$DEST/"
@@ -96,17 +102,15 @@ else
   ok "Already in place at $DEST"
 fi
 
-# Ensure scripts are executable
 chmod +x "$DEST/bin/start-virtualdj.sh" "$DEST/bin/nv-screens" 2>/dev/null || true
 find "$DEST/bin" "$DEST/scripts" "$DEST/tools" -type f 2>/dev/null | while read -r f; do
   head -1 "$f" 2>/dev/null | grep -q '^#!' && chmod +x "$f" || true
 done
 
-step 3/5 "Shortcuts in $BIN"
-# Thin wrapper with absolute path — works from PATH / desktop / cron
+step 3/6 "Shortcuts in $BIN"
 cat > "$BIN/start-virtualdj.sh" <<WRAP
 #!/usr/bin/env bash
-# Installed by nv-screens install.sh — do not edit; re-run install.sh to refresh
+# Installed by install.sh — re-run install.sh to refresh
 export ROOT="$DEST"
 exec "$DEST/bin/start-virtualdj.sh" "\$@"
 WRAP
@@ -116,7 +120,6 @@ ok "start-virtualdj.sh → $DEST/bin/start-virtualdj.sh"
 install -m 0755 "$DEST/bin/vdj-set-nv-audio.py" "$BIN/vdj-set-nv-audio.py"
 ok "vdj-set-nv-audio.py"
 
-# Desktop entry with absolute Exec + Path (GNOME/KDE/etc.)
 APPS="$HOME/.local/share/applications"
 mkdir -p "$APPS"
 DESKTOP="$APPS/numark-nv-virtualdj.desktop"
@@ -126,7 +129,7 @@ Version=1.0
 Type=Application
 Name=VirtualDJ (Numark NV)
 GenericName=DJ Software
-Comment=Start VirtualDJ with Numark NV dual LCDs + controllers
+Comment=VirtualDJ under Wine — Numark NV dual LCDs + controllers
 Exec=$BIN/start-virtualdj.sh
 TryExec=$BIN/start-virtualdj.sh
 Path=$DEST
@@ -139,15 +142,10 @@ EOF
 chmod 0644 "$DESKTOP"
 ok "Desktop entry → $DESKTOP"
 
-# Refresh menu caches when tools exist
 if have update-desktop-database; then
   update-desktop-database "$APPS" 2>/dev/null || true
 fi
-if have gtk-update-icon-cache; then
-  true
-fi
 
-# PATH hint
 case ":$PATH:" in
   *":$BIN:"*) ok "$BIN is on PATH" ;;
   *)
@@ -157,7 +155,25 @@ case ":$PATH:" in
     ;;
 esac
 
-step 4/5 "USB udev rules (optional password)…"
+step 4/6 "DXVK video stack (deck video / karaoke under Wine)…"
+DXVK_SCRIPT="$DEST/scripts/install-dxvk.sh"
+if [[ "$INSTALL_DXVK" == "0" || "$INSTALL_DXVK" == "no" ]]; then
+  warn "Skipped DXVK (NV_INSTALL_DXVK=0)"
+elif [[ ! -x "$DXVK_SCRIPT" && ! -f "$DXVK_SCRIPT" ]]; then
+  warn "No install-dxvk.sh — video stack not in this tree"
+elif [[ ! -d "$DEST/wine-stack/dxvk/x64" ]]; then
+  warn "No prebuilt DXVK DLLs at wine-stack/dxvk/x64 — skip video stack"
+elif [[ ! -d "$WINEPREFIX/drive_c/windows/system32" ]]; then
+  warn "No Wine prefix at $WINEPREFIX yet"
+  echo "    Install VirtualDJ under Wine first, then run:"
+  echo "      WINEPREFIX=$WINEPREFIX $DXVK_SCRIPT"
+elif ask_yn "Install DXVK for VDJ video in $WINEPREFIX? [Y/n] " Y; then
+  bash "$DXVK_SCRIPT" || warn "DXVK install reported errors — check Wine prefix"
+else
+  warn "Skipped DXVK"
+fi
+
+step 5/6 "USB udev rules (optional password)…"
 RULES_SRC="$DEST/config/udev/99-numark-nv.rules"
 if [[ -f "$RULES_SRC" ]]; then
   if [[ -f /etc/udev/rules.d/99-numark-nv.rules ]]; then
@@ -170,7 +186,6 @@ if [[ -f "$RULES_SRC" ]]; then
     echo "  Manual (if needed later):"
     echo "    sudo cp $RULES_SRC /etc/udev/rules.d/"
     echo "    sudo udevadm control --reload-rules && sudo udevadm trigger"
-    # Only offer sudo when interactive (password prompt works)
     if [[ -z "$AUTO_YES" ]] && [[ -t 0 ]] && ask_yn "Run with sudo now? [Y/n] " Y; then
       if sudo cp -a "$RULES_SRC" /etc/udev/rules.d/99-numark-nv.rules \
         && sudo udevadm control --reload-rules \
@@ -185,23 +200,28 @@ if [[ -f "$RULES_SRC" ]]; then
   fi
 fi
 
-step 5/5 "Logo restore sudoers (optional)"
+step 6/6 "Logo restore sudoers (optional)"
 RESET="$DEST/scripts/usb-reset-nv.sh"
 echo "  For passwordless logo restore on VDJ exit, add to sudoers:"
 echo -e "    ${B}$USER ALL=(root) NOPASSWD: $RESET${N}"
-echo "  (compat wrapper still at $DEST/tools/usb-reset-nv.sh)"
+echo "  (compat wrapper: $DEST/tools/usb-reset-nv.sh)"
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nv-screens"
 mkdir -p "$STATE" 2>/dev/null || true
 
 echo
-ok "Install complete — version $(cat "$DEST/VERSION" 2>/dev/null || echo 1.1.2)"
+ok "Install complete — version $(cat "$DEST/VERSION" 2>/dev/null || echo "$VER")"
 echo
-echo "  Start with:"
+echo "  What you have:"
+echo "    • Numark NV dual LCD host + launcher"
+echo "    • Optional DXVK (video in VDJ under Wine)"
+echo "    • winealsa patch bind (if wine-patch present)"
+echo
+echo "  Start:"
 echo -e "    ${B}$BIN/start-virtualdj.sh${N}"
 echo "  or app menu:  ${B}VirtualDJ (Numark NV)${N}"
 echo
-echo "  Logs (this user only):"
-echo "    $STATE/screens-live.log"
-echo "    $STATE/midi-connect.log"
+echo "  Video check:  DXVK_HUD=1 $BIN/start-virtualdj.sh"
+echo "  Logs:         $STATE/screens-live.log"
+echo "                $STATE/midi-connect.log"
 echo

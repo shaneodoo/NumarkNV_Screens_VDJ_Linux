@@ -1,77 +1,105 @@
-# Install — Numark NV + VirtualDJ on Linux
+# Install — VirtualDJ on Linux (NV screens + video)
 
 ## What you need
 
 | Item | Notes |
 |------|--------|
-| Numark NV | Plugged in over USB |
-| Linux PC | Fedora, Ubuntu, Zorin, etc. |
+| Linux PC | Fedora, Ubuntu, Arch, … |
 | Wine | Wine or Wine Staging |
-| VirtualDJ | Install the desktop app **under Wine** (from virtualdj.com) |
-| Python + pyusb | For the LCD host |
+| VirtualDJ | Install under Wine from virtualdj.com |
+| Vulkan | GPU drivers that work with DXVK (for video) |
+| Python 3 + pyusb | LCD host |
 | alsa-utils | `aconnect` / `amidi` |
+| Numark NV | For dual hardware LCDs (optional if you only want VDJ video) |
 
 ## 1. Packages
 
 **Fedora**
 
 ```bash
-sudo dnf install wine python3-pyusb bubblewrap alsa-utils git
+sudo dnf install wine python3-pyusb bubblewrap alsa-utils git vulkan-tools
 ```
 
 **Ubuntu / Debian / Zorin**
 
 ```bash
 sudo apt update
-sudo apt install wine python3-pyusb bubblewrap alsa-utils git
+sudo apt install wine python3-pyusb bubblewrap alsa-utils git vulkan-tools
 ```
 
 **Arch**
 
 ```bash
-sudo pacman -S wine python-pyusb bubblewrap alsa-utils git
+sudo pacman -S wine python-pyusb bubblewrap alsa-utils git vulkan-tools
 ```
 
-If pyusb is still missing: `python3 -m pip install --user pyusb`
+Install your vendor Vulkan driver (Mesa / NVIDIA / AMD) the usual way for your distro.
+
+If pyusb is missing: `python3 -m pip install --user pyusb`
 
 ## 2. VirtualDJ under Wine (once)
 
-1. Install Wine.
-2. Download the VirtualDJ installer from virtualdj.com.
-3. Run it: `wine ~/Downloads/install_virtualdj.exe` (path may vary).
-4. Finish the installer.
+```bash
+wineboot -u   # if you have no prefix yet
+wine ~/Downloads/install_virtualdj.exe   # path may vary
+```
 
-Default path is usually:
+Default:
 
 `~/.wine/drive_c/Program Files/VirtualDJ/virtualdj.exe`
 
-## 3. Get this project
+**64-bit VirtualDJ** is recommended (this is what the DXVK x64 stack targets).
+
+## 3. Clone and install
 
 ```bash
 mkdir -p ~/src
 cd ~/src
 git clone https://github.com/shaneodoo/NumarkNV_Screens_VDJ_Linux.git
 cd NumarkNV_Screens_VDJ_Linux
-```
-
-Or download the source zip from the Releases page and open that folder.
-
-## 4. Installer
-
-```bash
-chmod +x install.sh
 ./install.sh
 ```
 
-It will:
+Answer **Y** for DXVK when asked (enables deck video / karaoke under Wine).
 
-- Check Python, Wine, ALSA, PyUSB  
-- Copy files (default: `~/src/nv-screens`)  
-- Put `start-virtualdj.sh` in `~/bin`  
-- Offer USB udev rules (password once)  
-- Add app menu entry: **VirtualDJ (Numark NV)**
+### What install.sh does
 
-## 5. USB permissions (if skipped)
+| Step | Action |
+|------|--------|
+| Tree | Copies to `~/src/nv-screens` by default |
+| Launcher | `~/bin/start-virtualdj.sh` + app menu |
+| **DXVK** | Native d3d11/d3d9/dxgi into your Wine prefix |
+| udev | USB rules for NV bulk LCD (optional password) |
+| Hint | sudoers line for logo restore on quit |
+
+### Useful env vars
+
+| Variable | Meaning |
+|----------|---------|
+| `WINEPREFIX` | Which Wine bottle gets DXVK (default `~/.wine`) |
+| `NV_INSTALL_ROOT` | Where files are copied (default `~/src/nv-screens`) |
+| `NV_BIN_DIR` | Where the launcher goes (default `~/bin`) |
+| `NV_INSTALL_DXVK=0` | Skip video DLL install |
+| `NV_INSTALL_YES=1` | Non-interactive (yes to prompts) |
+
+## 4. DXVK only (video, any prefix)
+
+If you already installed the tree:
+
+```bash
+export WINEPREFIX=$HOME/.wine
+~/src/nv-screens/scripts/install-dxvk.sh
+```
+
+Prove DXVK is active:
+
+```bash
+DXVK_HUD=1 start-virtualdj.sh
+```
+
+You should see a small DXVK overlay (fps / device), not a blank wined3d fail for video.
+
+## 5. USB permissions (Numark NV)
 
 ```bash
 sudo cp config/udev/99-numark-nv.rules /etc/udev/rules.d/
@@ -79,56 +107,42 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Unplug and replug the Numark NV once.
+Unplug and replug the NV once.
 
-## 6. Logos on quit (optional, no password each time)
+## 6. Logos on quit (optional)
 
 ```bash
 sudo visudo
 ```
 
-Add one line (use your user and path):
-
 ```text
 YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/nv-screens/scripts/usb-reset-nv.sh
 ```
 
-Older installs may use `tools/usb-reset-nv.sh` (same script, thin wrapper).
-
 ## 7. Start
 
-Plug in the NV, then:
-
 - App menu → **VirtualDJ (Numark NV)**  
-- Or: `start-virtualdj.sh`  
-- Or: `~/bin/start-virtualdj.sh`
-
-On quit, the host stops and logos restore if sudoers is set.
-
-## 8. First time in VirtualDJ
-
-- Controllers: factory Numark NV / Display Left / Display Right where available  
-- Audio: NV Audio / NUMARK NV if listed  
+- Or: `start-virtualdj.sh` / `~/bin/start-virtualdj.sh`
 
 ## Everyday
 
 | Action | How |
 |--------|-----|
-| Start | `start-virtualdj.sh` or app menu |
+| Start | `start-virtualdj.sh` |
 | Stop | Quit VirtualDJ |
-| Logs | `~/.local/state/nv-screens/screens-live.log` and `midi-connect.log` |
+| NV LCD logs | `~/.local/state/nv-screens/screens-live.log` |
+| Re-apply DXVK | `scripts/install-dxvk.sh` |
 
 ## Troubleshooting
 
 | Problem | Try |
 |---------|-----|
-| Screens stay on logo | Check `screens-live.log`. Unplug/replug NV. Run launcher again. |
-| No controllers | Host must be running; check `aconnect -l` for `nv-screens`. |
-| No sound | Audio settings → NV Audio. |
-| USB permission denied | Step 5 udev, replug. |
-| Start fails with log permission | Use this tree (logs are per-user under `~/.local/state/nv-screens/`). Re-run `./install.sh`. |
-| App menu wrong path | Re-run `./install.sh`. Or run `~/bin/start-virtualdj.sh` in a terminal. |
-| Logos not restoring | Step 6 sudoers. Manual: `sudo ~/src/nv-screens/scripts/usb-reset-nv.sh` |
+| No deck video / black video | Run `scripts/install-dxvk.sh`. Check Vulkan. `DXVK_HUD=1`. |
+| Screens stay on logo | Host running? udev? `screens-live.log`. Replug NV. |
+| No controllers | `aconnect -l` — look for `nv-screens`. |
+| No sound | VDJ audio → NV Audio / ALSA. |
+| DXVK install: no prefix | Install VDJ under Wine first, then re-run `./install.sh` or `install-dxvk.sh`. |
+| App menu wrong path | Re-run `./install.sh`. |
 
 ## Upgrade
 
@@ -137,3 +151,7 @@ cd ~/src/NumarkNV_Screens_VDJ_Linux
 git pull
 ./install.sh
 ```
+
+## Not supported officially
+
+Atomix does not ship this. Wine can change; re-run install after big Wine upgrades if video or audio acts up.

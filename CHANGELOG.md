@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.0 — 2026-08-06
+
+Full Linux VDJ stack: Numark NV screens **plus** portable DXVK for video.
+
+### Added
+- **`wine-stack/dxvk/`** — prebuilt x64/x32 DXVK with Linux **shared texture** support so 64-bit VirtualDJ can show deck video / karaoke under Wine (stock Wine/DXVK often cannot).
+- **`scripts/install-dxvk.sh`** — installs DLLs + native overrides into any `WINEPREFIX` (not machine-specific).
+- **`install.sh`** step for DXVK (skip with `NV_INSTALL_DXVK=0`).
+- Patch source: `wine-stack/dxvk/patches/dxvk-linux-shared-res.patch` for rebuilds.
+
+### Notes
+- Needs a working **Vulkan** driver on the host.
+- NV hardware is optional if you only want VDJ video under Wine.
+- Still community glue — not official Atomix support.
+
+### Upgrade
+```bash
+git pull
+./install.sh
+```
+
+---
+
 ## 1.1.2 — 2026-08-05
 
 End-user install polish: multi-user safe launcher + reliable desktop icon.
