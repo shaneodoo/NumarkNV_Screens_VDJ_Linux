@@ -114,33 +114,6 @@ trim_log "$LOG"
 log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; trim_log "$LOG"; }
 log "=== desktop launch === ROOT=$ROOT user=$USER log_max=${LOG_MAX_BYTES}"
 
-if [[ -n "$MOUNT" && -d "$MOUNT/DJ" ]]; then
-  ln -sfn "$MOUNT" "$DOS/d:" 2>/dev/null || true
-  ln -sfn "$MOUNT/DJ" "$HOME/Music/DJ" 2>/dev/null || true
-fi
-if [[ -d "$DOS" ]]; then
-  ln -sfn "$HOME" "$DOS/z:" 2>/dev/null || true
-  rm -f "$DOS/j:" "$DOS/j::" "$DOS/y:" 2>/dev/null || true
-fi
-
-if [[ -f "$VDJ_SETTINGS" ]]; then
-  python3 - "$VDJ_SETTINGS" <<'PY' || true
-import re, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-t = p.read_text(encoding="utf-8", errors="replace")
-for a, b in [
-    (r"<ignoreDrives\s*/>", "<ignoreDrives>Z</ignoreDrives>"),
-    (r"<ignoreDrives>[^<]*</ignoreDrives>", "<ignoreDrives>Z</ignoreDrives>"),
-    (r"<controllerRefreshRate>[^<]*</controllerRefreshRate>", "<controllerRefreshRate>30</controllerRefreshRate>"),
-]:
-    t2, n = re.subn(a, b, t, count=1)
-    if n:
-        t = t2
-p.write_text(t, encoding="utf-8")
-PY
-fi
-
 FAV="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/Folders/DJ.vdjfolder"
 if [[ -d "$WINEPREFIX" ]]; then
   mkdir -p "$(dirname "$FAV")" 2>/dev/null || true
