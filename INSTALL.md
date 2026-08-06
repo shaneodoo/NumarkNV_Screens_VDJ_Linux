@@ -138,7 +138,8 @@ YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/nv-screens/scripts/usb-reset-nv
 | Problem | Try |
 |---------|-----|
 | No deck video / black video | Run `scripts/install-dxvk.sh`. Check Vulkan. `DXVK_HUD=1`. |
-| Screens stay on logo | Host running? udev? `screens-live.log`. Replug NV. |
+| Virtual DJ screen glitching | In VDJ open settings > Options, Search for 'experimentalSkinEngine' set to NO |
+| NV Screens stay on logo | Host running? udev? `screens-live.log`. Replug NV. |
 | No controllers | `aconnect -l` — look for `nv-screens`. |
 | No sound | VDJ audio → NV Audio / ALSA. |
 | DXVK install: no prefix | Install VDJ under Wine first, then re-run `./install.sh` or `install-dxvk.sh`. |
