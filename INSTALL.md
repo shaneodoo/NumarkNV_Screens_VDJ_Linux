@@ -130,7 +130,7 @@ YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/nv-screens/scripts/usb-reset-nv
 |--------|-----|
 | Start | `start-virtualdj.sh` |
 | Stop | Quit VirtualDJ |
-| NV LCD logs | `~/.local/state/nv-screens/screens-live.log` |
+| NV LCD logs | `~/.local/state/nv-screens/` (capped ~1 MiB; CSV off unless `NV_CSV_LOG=1`) |
 | Re-apply DXVK | `scripts/install-dxvk.sh` |
 
 ## Troubleshooting

@@ -65,6 +65,9 @@ start-virtualdj.sh
 
 ## Logs
 
+Kept short for long gigs (default max ~1 MiB per file, trimmed while running).
+CSV traffic dump is **off** unless `NV_CSV_LOG=1`.
+
 ```
 ~/.local/state/nv-screens/screens-live.log
 ~/.local/state/nv-screens/midi-connect.log

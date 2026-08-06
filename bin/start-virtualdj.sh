@@ -62,6 +62,7 @@ EXE="$WINEPREFIX/drive_c/Program Files/VirtualDJ/virtualdj.exe"
 MOUNT="${NV_DJ_MOUNT:-}"
 
 # Per-user state (never share /tmp logs across accounts)
+# Keep logs short for long gigs — defaults are small; override with env if needed.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nv-screens"
 mkdir -p "$STATE_DIR" "$HOME/bin" 2>/dev/null || true
 LOG="${NV_CONNECT_LOG:-$STATE_DIR/midi-connect.log}"
@@ -70,15 +71,48 @@ NV_PIDFILE="${XDG_RUNTIME_DIR:-$STATE_DIR}/nv-screens.pid"
 NV_SCRIPT="$ROOT/bin/nv-screens"
 WIRE_SCRIPT="$ROOT/scripts/wire_hybrid.sh"
 USB_RESET="$ROOT/scripts/usb-reset-nv.sh"
+# CSV traffic dump is huge — off unless NV_CSV_LOG=1
 CSV_LOG="$STATE_DIR/vdj-from-wine-live.csv"
 BRIDGE_LOG="$STATE_DIR/live-bridge.txt"
+# Max size (bytes) before trim; default 1 MiB each (~few thousand lines)
+LOG_MAX_BYTES="${NV_LOG_MAX_BYTES:-1048576}"
 
-# Ensure we can write logs (create empty files we own)
+# Keep only the tail of a log if it grew past LOG_MAX_BYTES
+trim_log() {
+  local f="$1" max="${2:-$LOG_MAX_BYTES}" sz keep
+  [[ -f "$f" ]] || return 0
+  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  (( sz > max )) || return 0
+  keep=$(( max / 2 ))
+  (( keep < 65536 )) && keep=65536
+  tail -c "$keep" "$f" >"${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "$f" || true
+}
+
+# While host runs, periodically trim state logs (long gigs)
+log_trimmer() {
+  local pidfile="$1"
+  while true; do
+    sleep 120
+    [[ -f "$pidfile" ]] || break
+    local p
+    p=$(cat "$pidfile" 2>/dev/null || true)
+    [[ -n "${p:-}" ]] && kill -0 "$p" 2>/dev/null || break
+    trim_log "$NV_LOG"
+    trim_log "$LOG"
+    trim_log "$CSV_LOG" "$((LOG_MAX_BYTES * 2))"
+    trim_log "$BRIDGE_LOG"
+  done
+}
+
+# Fresh session logs (don't append forever across gigs)
+: >"$NV_LOG" 2>/dev/null || true
+: >"$BRIDGE_LOG" 2>/dev/null || true
+rm -f "$CSV_LOG" 2>/dev/null || true
+trim_log "$LOG"
 : >>"$LOG" 2>/dev/null || LOG="$STATE_DIR/midi-connect.log"
-: >>"$LOG" || true
 
-log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
-log "=== desktop launch === ROOT=$ROOT user=$USER"
+log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; trim_log "$LOG"; }
+log "=== desktop launch === ROOT=$ROOT user=$USER log_max=${LOG_MAX_BYTES}"
 
 if [[ -n "$MOUNT" && -d "$MOUNT/DJ" ]]; then
   ln -sfn "$MOUNT" "$DOS/d:" 2>/dev/null || true
@@ -213,15 +247,27 @@ start_nv_screens() {
   log "Starting nv-screens (host, not bwrap)"
   : >"$NV_LOG"
   : >"$BRIDGE_LOG"
-  : >"$CSV_LOG"
+  # Optional bulk CSV (dev only — fills disks on long sets)
+  local csv_args=()
+  if [[ "${NV_CSV_LOG:-0}" == "1" ]]; then
+    : >"$CSV_LOG"
+    csv_args=(--csv-log "$CSV_LOG" --vdj-csv "$CSV_LOG")
+    log "CSV traffic log ON → $CSV_LOG (NV_CSV_LOG=1)"
+  else
+    rm -f "$CSV_LOG" 2>/dev/null || true
+    log "CSV traffic log off (set NV_CSV_LOG=1 to enable)"
+  fi
   nohup python3 -u "$NV_SCRIPT" \
     --patchbay --no-wait --live-only \
     --idle-after-vdj-s 2 \
     --wake-mode open \
-    --csv-log "$CSV_LOG" --vdj-csv "$CSV_LOG" \
+    "${csv_args[@]}" \
     >>"$NV_LOG" 2>&1 &
   echo $! >"$NV_PIDFILE"
   log "nv-screens pid=$(cat "$NV_PIDFILE")"
+  # Cap log growth during the session
+  log_trimmer "$NV_PIDFILE" &
+  disown $! 2>/dev/null || true
 }
 
 wait_for_nv_client() {
