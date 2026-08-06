@@ -54,7 +54,7 @@ def midi_to_usb_midi(msg: bytes) -> bytes:
     """
     Pack any short MIDI or SysEx into USB-MIDI bulk cells (CIN + 3 data).
 
-    This is what Windows VDJ puts on the wire; ALSA/amidi re-encoding is not enough.
+    This is what VDJ puts on the wire; ALSA/amidi re-encoding is not enough.
     """
     if not msg:
         return b""
@@ -213,7 +213,7 @@ class NvBulkPainter:
             if dev is None:
                 print(f"[nv] missing 15e4:{pid:04x}", flush=True)
                 continue
-            # WinBoat: Audio 1033 = Display Left, Graphics 2033 = Display Right.
+            # reference: Audio 1033 = Display Left, Graphics 2033 = Display Right.
             # Graphics: exclusive (hide ALSA; facade presents "NV Graphics").
             # Audio: MIDI bulk only — hide Audio *MIDI* (facade "NV Audio") but
             # keep PCM for Wine/VDJ sound + NUMARK NV audio button.
@@ -248,7 +248,7 @@ class NvBulkPainter:
         if not self.handles:
             raise RuntimeError(
                 "No NV Graphics/Audio MIDI bulk claimed. "
-                "Unplug WinBoat passthrough / stop other paint tools."
+                "Stop other tools using the NV USB devices."
             )
 
     def _rebind_audio_pcm(self, dev: usb.core.Device) -> None:
@@ -495,7 +495,7 @@ class NvBulkPainter:
     def stock_firmware_reenum(self, *, wipe_already_done: bool = False) -> bool:
         """Stock restore via tools/usb-reset-nv.sh (sudo -n).
 
-        WinUSBNCap finding:
+        USB finding:
           1) zero-chrome bulk wipe (skip if wipe_already_done — host did it)
           2) authorized 0→1 → firmware logos
 
@@ -517,7 +517,7 @@ class NvBulkPainter:
             cmd.append("--reenum-only")
             print("[nv] stock re-enum only (zero-wipe already done)…", flush=True)
         else:
-            print("[nv] stock wipe + re-enum (WinUSBNCap close bulk → logos)…", flush=True)
+            print("[nv] stock wipe + re-enum → logos…", flush=True)
         try:
             r = subprocess.run(
                 cmd,
@@ -631,7 +631,7 @@ class NvBulkPainter:
         inter_chunk_s: float = 0.0,
     ) -> bool:
         # Route F0 47 <hi> <lo> … to the matching USB product when present
-        # (Windows paint: 0x2033 Graphics vs 0x1033 Audio ≈ dual LCD streams).
+        # (panel paint: 0x2033 Graphics vs 0x1033 Audio ≈ dual LCD streams).
         if pids is None and len(msg) >= 4 and msg[0] == 0xF0 and msg[1] == 0x47:
             prod = (msg[2] << 8) | msg[3]
             if any(h.pid == prod for h in self.handles):
@@ -641,7 +641,7 @@ class NvBulkPainter:
         )
 
     def write_record(self, pid: int, ep: int, payload: bytes) -> bool:
-        """Replay one captured bulk URB (exact bytes from USBPcap)."""
+        """Replay one captured bulk URB (exact bytes from USB)."""
         for h in self.handles:
             if h.pid != pid:
                 continue

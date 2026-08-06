@@ -1,96 +1,49 @@
-# Easy install guide
-
-**Numark NV + VirtualDJ on Linux** (v1.1.2)
-
-Get dual LCDs + Controllers working with VirtualDJ under Wine.  
-No Windows required on the host PC.
-
----
-
-## Option A — Flatpak (glue only)
-
-Installs the NV screens host + launcher. **Does not include Wine or VirtualDJ**
-(install those on the host yourself).
-
-```bash
-# Build once (from this repo)
-./flatpak/build.sh
-flatpak install --user -y ./flatpak/nv-screens.flatpak
-
-# One-time USB permissions
-flatpak run io.github.shaneodoo.NvScreens --install-udev
-# unplug/replug Numark NV
-
-# Everyday
-flatpak run io.github.shaneodoo.NvScreens
-```
-
-See [flatpak/README.md](flatpak/README.md).
-
----
-
-## Option B — Classic install from git
+# Install — Numark NV + VirtualDJ on Linux
 
 ## What you need
 
 | Item | Notes |
 |------|--------|
-| **Numark NV** | Plugged in over USB |
-| **Linux PC** | Fedora, Ubuntu, Zorin, etc. |
-| **Wine** | Wine or Wine Staging |
-| **VirtualDJ (Windows)** | Installed *inside* Wine (same as on Windows) |
-| **Internet** | First-time package download only |
+| Numark NV | Plugged in over USB |
+| Linux PC | Fedora, Ubuntu, Zorin, etc. |
+| Wine | Wine or Wine Staging |
+| VirtualDJ | Install the desktop app **under Wine** (from virtualdj.com) |
+| Python + pyusb | For the LCD host |
+| alsa-utils | `aconnect` / `amidi` |
 
-You do **not** need a Windows dual-boot for day-to-day use.
+## 1. Packages
 
----
-
-## 1. Install system packages
-
-### Fedora / RHEL
+**Fedora**
 
 ```bash
 sudo dnf install wine python3-pyusb bubblewrap alsa-utils git
 ```
 
-### Ubuntu / Zorin / Debian
+**Ubuntu / Debian / Zorin**
 
 ```bash
 sudo apt update
 sudo apt install wine python3-pyusb bubblewrap alsa-utils git
 ```
 
-### Arch
+**Arch**
 
 ```bash
 sudo pacman -S wine python-pyusb bubblewrap alsa-utils git
 ```
 
-If PyUSB is missing:
+If pyusb is still missing: `python3 -m pip install --user pyusb`
 
-```bash
-python3 -m pip install --user pyusb
-```
+## 2. VirtualDJ under Wine (once)
 
----
+1. Install Wine.
+2. Download the VirtualDJ installer from virtualdj.com.
+3. Run it: `wine ~/Downloads/install_virtualdj.exe` (path may vary).
+4. Finish the installer.
 
-## 2. Install VirtualDJ in Wine (once)
-
-1. Install Wine if you have not already (step 1).
-2. Download the **Windows** VirtualDJ installer from virtualdj.com.
-3. Run it under Wine, for example:
-
-```bash
-wine ~/Downloads/install_virtualdj.exe
-```
-
-4. Finish the VDJ installer as you would on Windows (license, folders).
-
-Default location is usually:
+Default path is usually:
 
 `~/.wine/drive_c/Program Files/VirtualDJ/virtualdj.exe`
-
----
 
 ## 3. Get this project
 
@@ -101,28 +54,24 @@ git clone https://github.com/shaneodoo/NumarkNV_Screens_VDJ_Linux.git
 cd NumarkNV_Screens_VDJ_Linux
 ```
 
-Or download the **Source code (zip)** from the [Releases](https://github.com/shaneodoo/NumarkNV_Screens_VDJ_Linux/releases) page, unzip, and open that folder in a terminal.
+Or download the source zip from the Releases page and open that folder.
 
----
-
-## 4. Run the installer
+## 4. Installer
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-Answer **Y** when asked. The script will:
+It will:
 
 - Check Python, Wine, ALSA, PyUSB  
 - Copy files (default: `~/src/nv-screens`)  
-- Put **`start-virtualdj.sh`** in `~/bin`  
-- Offer to install USB rules (password once)  
-- Add an app menu entry: **VirtualDJ (Numark NV)**
+- Put `start-virtualdj.sh` in `~/bin`  
+- Offer USB udev rules (password once)  
+- Add app menu entry: **VirtualDJ (Numark NV)**
 
----
-
-## 5. USB permissions (if the installer skipped them)
+## 5. USB permissions (if skipped)
 
 ```bash
 sudo cp config/udev/99-numark-nv.rules /etc/udev/rules.d/
@@ -132,159 +81,59 @@ sudo udevadm trigger
 
 Unplug and replug the Numark NV once.
 
----
-
-## 6. Optional: logos back on quit (no password prompt)
-
-When you close VirtualDJ, the host restores the stock NV logos. That uses a small script as root.
-
-1. Open sudoers safely:
+## 6. Logos on quit (optional, no password each time)
 
 ```bash
 sudo visudo
 ```
 
-2. Add **one line** at the end (change `YOURUSER` and path if needed):
+Add one line (use your user and path):
 
 ```text
 YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/nv-screens/scripts/usb-reset-nv.sh
 ```
 
-If you installed only from the git clone folder and never copied to `~/src/nv-screens`, use that full path instead, e.g.:
+Older installs may use `tools/usb-reset-nv.sh` (same script, thin wrapper).
 
-```text
-YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/NumarkNV_Screens_VDJ_Linux/scripts/usb-reset-nv.sh
-```
+## 7. Start
 
-An older path still works if you used 1.0.x:
-
-```text
-…/tools/usb-reset-nv.sh
-```
-
-(that file is now a tiny wrapper to `scripts/`).
-
----
-
-## 7. Start VirtualDJ + screens
-
-Plug in the NV, then either:
+Plug in the NV, then:
 
 - App menu → **VirtualDJ (Numark NV)**  
-- Or terminal:
+- Or: `start-virtualdj.sh`  
+- Or: `~/bin/start-virtualdj.sh`
 
-```bash
-start-virtualdj.sh
-```
+On quit, the host stops and logos restore if sudoers is set.
 
-If `start-virtualdj.sh` is not found:
+## 8. First time in VirtualDJ
 
-```bash
-~/bin/start-virtualdj.sh
-# or
-~/src/nv-screens/bin/start-virtualdj.sh
-```
+- Controllers: factory Numark NV / Display Left / Display Right where available  
+- Audio: NV Audio / NUMARK NV if listed  
 
-What happens:
-
-1. LCD host starts and wakes both screens  
-2. MIDI is wired (Controllers + displays)  
-3. VirtualDJ opens under Wine  
-
-When you **quit VirtualDJ**, the host stops and (if sudoers is set) logos return.
-
----
-
-## 8. First time inside VirtualDJ
-
-1. **Config → Controllers**  
-   - You should see **Numark NV**, **NV Display Left**, **NV Display Right** (or similar factory names).  
-2. Mapping: **Numark NV - Custom Mapping** (or factory default if you prefer).  
-3. **Config → Audio**  
-   - Prefer **NV Audio** for master/phones when the card is present.  
-4. Load a track — left/right LCDs should show deck UI / waveforms.  
-5. Turn a **browse** encoder (SEL) — library list appears on that side’s LCD.  
-6. Optional: click the **song** list with the mouse — library can open on the LCD (mapping must be loaded; restart VDJ once after install if needed).
-
----
-
-## Check that the hardware is seen
-
-```bash
-lsusb | grep -i 15e4
-```
-
-You want three lines (Control / Audio / Graphics), for example:
-
-- `15e4:1005` Control  
-- `15e4:1033` Audio (left LCD + sound)  
-- `15e4:2033` Graphics (right LCD)  
-
-MIDI clients (while the host is running):
-
-```bash
-aconnect -l | head -40
-```
-
-Look for `nv-screens` and `nv-screens-facade-midi`.
-
----
-
-## Everyday use
+## Everyday
 
 | Action | How |
 |--------|-----|
-| Start session | `start-virtualdj.sh` or app menu |
-| Stop session | Quit VirtualDJ as usual |
-| Logs (if something fails) | `~/.local/state/nv-screens/screens-live.log` and `midi-connect.log` |
+| Start | `start-virtualdj.sh` or app menu |
+| Stop | Quit VirtualDJ |
+| Logs | `~/.local/state/nv-screens/screens-live.log` and `midi-connect.log` |
 
----
+## Troubleshooting
 
-## Upgrading from 1.0.0
+| Problem | Try |
+|---------|-----|
+| Screens stay on logo | Check `screens-live.log`. Unplug/replug NV. Run launcher again. |
+| No controllers | Host must be running; check `aconnect -l` for `nv-screens`. |
+| No sound | Audio settings → NV Audio. |
+| USB permission denied | Step 5 udev, replug. |
+| Start fails with log permission | Use this tree (logs are per-user under `~/.local/state/nv-screens/`). Re-run `./install.sh`. |
+| App menu wrong path | Re-run `./install.sh`. Or run `~/bin/start-virtualdj.sh` in a terminal. |
+| Logos not restoring | Step 6 sudoers. Manual: `sudo ~/src/nv-screens/scripts/usb-reset-nv.sh` |
+
+## Upgrade
 
 ```bash
-cd ~/src/NumarkNV_Screens_VDJ_Linux   # or your clone path
+cd ~/src/NumarkNV_Screens_VDJ_Linux
 git pull
 ./install.sh
 ```
-
-Paths changed (`tools2`/`src2` → `bin`/`nv_screens`/`scripts`). The installer updates `~/bin/start-virtualdj.sh`.
-
----
-
-## Troubleshooting (quick)
-
-| Problem | Try this |
-|---------|----------|
-| Screens stay on logo | Is `nv-screens` running? Check `~/.local/state/nv-screens/screens-live.log`. Unplug/replug NV, run `start-virtualdj.sh` again. |
-| No Controllers in VDJ | Host must be up **before** or with the launcher; check `aconnect -l` for facade ports. |
-| No sound | Config → Audio → NV Audio / correct Wine ALSA device. |
-| “Permission denied” USB | Step 5 (udev), replug NV. |
-| “Permission denied” on start / line near logs | Fixed in **v1.1.2** — do not use shared `/tmp/nv-*.log`. Pull latest, re-run `./install.sh`. Logs are per-user under `~/.local/state/nv-screens/`. |
-| App menu does nothing / wrong path | Re-run `./install.sh` (writes absolute `Exec=` + `Path=`). Or run `~/bin/start-virtualdj.sh` in a terminal to see errors. |
-| Logos not restoring | Step 6 (sudoers). Manual: `sudo ~/src/nv-screens/scripts/usb-reset-nv.sh` |
-| Mouse list not on LCD | Restart VDJ once; use browse knobs once; ensure Custom Mapping is selected. |
-
-More detail: [docs/HYBRID-DAILY.md](docs/HYBRID-DAILY.md), [docs/SYSTEM-PICTURE.md](docs/SYSTEM-PICTURE.md).
-
----
-
-## Uninstall (optional)
-
-```bash
-rm -f ~/bin/start-virtualdj.sh ~/bin/vdj-set-nv-audio.py
-rm -f ~/.local/share/applications/numark-nv-virtualdj.desktop
-# optional: remove install tree
-# rm -rf ~/src/nv-screens
-# optional: remove udev rule
-# sudo rm /etc/udev/rules.d/99-numark-nv.rules
-```
-
-VirtualDJ and Wine stay installed unless you remove them yourself.
-
----
-
-## License / disclaimer
-
-See [LICENSE](LICENSE). Not affiliated with Numark, inMusic, or Atomix / VirtualDJ.  
-For use with hardware you own.

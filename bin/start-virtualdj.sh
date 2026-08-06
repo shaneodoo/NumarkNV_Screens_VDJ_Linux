@@ -1,20 +1,9 @@
 #!/usr/bin/env bash
-# VirtualDJ + Numark NV dual LCDs
-#
-# - nv-screens runs OUTSIDE bwrap (so sudo USB re-enum works on exit)
-# - only Wine is bwrap'd for winealsa.so
-# - wire Wine once (no retry thrash in qpwgraph)
-# - on exit: stop host → authorized 0→1 hub re-enum → firmware logos
-#
-# Multi-user safe: logs live under ~/.local/state/nv-screens (not /tmp).
-# ROOT auto-detects from this script's location when installed in-tree.
-#
+# Start LCD host + wire MIDI + launch VirtualDJ under Wine.
+# Logs: ~/.local/state/nv-screens/  (per user, not /tmp)
 set -euo pipefail
 
-# ---------- resolve ROOT ----------
-# 1) env ROOT (set by install wrapper / Flatpak)
-# 2) this script lives in <tree>/bin/ → parent is ROOT
-# 3) fallback ~/src/nv-screens
+# ROOT: env, or parent of this bin/, or ~/src/nv-screens
 _resolve_root() {
   local here parent
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,7 +63,7 @@ MOUNT="${NV_DJ_MOUNT:-}"
 
 # Per-user state (never share /tmp logs across accounts)
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nv-screens"
-mkdir -p "$STATE_DIR" "$HOME/bin" "$ROOT/captures" 2>/dev/null || true
+mkdir -p "$STATE_DIR" "$HOME/bin" 2>/dev/null || true
 LOG="${NV_CONNECT_LOG:-$STATE_DIR/midi-connect.log}"
 NV_LOG="${NV_SCREENS_LOG:-$STATE_DIR/screens-live.log}"
 NV_PIDFILE="${XDG_RUNTIME_DIR:-$STATE_DIR}/nv-screens.pid"
@@ -304,7 +293,7 @@ echo "=============================================="
 if [[ ! -f "$EXE" ]]; then
   echo "WARNING: VirtualDJ not found at:" >&2
   echo "  $EXE" >&2
-  echo "  Install the Windows VirtualDJ build under Wine first." >&2
+  echo "  Install VirtualDJ under Wine first." >&2
 fi
 
 set +e

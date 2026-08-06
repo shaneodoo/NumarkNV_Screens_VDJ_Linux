@@ -31,7 +31,7 @@ from nv_screens.usb_midi_bulk import (
 )  # noqa: E402
 from nv_screens.usb_midi_decode import PRODUCT_NAMES  # noqa: E402
 
-# Prefer the long Windows capture (paint-rich); fall back to short bulk-out.
+# Prefer the long capture (paint-rich); fall back to short bulk-out.
 _BULK_CANDIDATES = (
     ROOT / "data/wake/bulk-out.bin",
 )
@@ -39,7 +39,7 @@ BULK_BIN = next((p for p in _BULK_CANDIDATES if p.is_file()), _BULK_CANDIDATES[-
 # Short complete open+paint session — better for one-shot LCD wake than a
 # truncated prefix of bulk-long (first paint is at URB ~1474 / ~4998).
 WAKE_BULK_BIN = ROOT / "data/wake/bulk-out.bin"
-# Clean FULL wake for mass use: WinUSBNCap VDJ_start_stop_sequence.pcapng only
+# Full wake under data/wake/
 # (empty Controllers: open + FX chrome + default empty titles — NO 0509 tracks).
 # NOT NV_Capture_long_one / bulk-long (those had session track paint).
 WAKE_FULL_BIN = ROOT / "data/wake/empty-deck-bulk.bin"
@@ -57,7 +57,7 @@ HEX_V1 = ROOT / "captures/extracted/audio-sysex-hex.txt"
 # earlier mid-message desyncs firmware → black LCDs.
 _MIN_WAKE_URBS_LONG = 5200
 
-# Capture UI that still *looks* like the old WinBoat session (track art/title
+# Optional UI chrome (track art/title
 # "After Burn", tempo, waveforms). These are mostly bitmap tiles (0507/0524/0509),
 # not plain-text 0531 — so skipping only 0531/0509 still left After Burn on screen.
 _CAPTURE_CONTENT_CMDS = frozenset({
@@ -862,8 +862,8 @@ class NvScreensDaemon:
         self.wake_records: list[tuple[int, int, bytes]] = []
         self.wake_actions: list[tuple[str, int, bytes]] = []
         self.open_actions: list[tuple[str, int, bytes]] = []  # splash only (shutdown)
-        self.empty_deck: list[tuple[int, bytes]] = []  # WinBoat full empty UI
-        self.close_seq: list[tuple[int, bytes]] = []  # WinBoat File→Exit tail
+        self.empty_deck: list[tuple[int, bytes]] = []  # full empty UI
+        self.close_seq: list[tuple[int, bytes]] = []  # close sequence
         self.wake_mode: str = "chrome"
         self.init_msgs: list[bytes] = []
         self.paint_msgs: list[bytes] = []
@@ -933,7 +933,7 @@ class NvScreensDaemon:
         if self.wake_records:
             self.open_actions = _first_open_cycle_actions(self.wake_records)
 
-        # Preferred wake: full empty-deck UI from WinBoat VDJ_start_stop capture
+        # Preferred wake: full empty-deck UI
         # (0506/08/30 + 0501/02/07/24/21… — Controllers chrome, no track 0509).
         self.empty_deck: list[tuple[int, bytes]] = []
         self.close_seq: list[tuple[int, bytes]] = []
@@ -960,7 +960,7 @@ class NvScreensDaemon:
             "default",
             "",
         ):
-            # Prefer WinBoat empty-deck list; fall back to open-only actions
+            # Prefer empty-deck list; fall back to open-only actions
             self.wake_actions = list(self.open_actions)
         else:
             self.wake_actions = []  # full uses raw URBs
@@ -1582,8 +1582,8 @@ class NvScreensDaemon:
         """Wake firmware with RAW bulk URBs, then live VDJ paints.
 
         Re-encoded SysEx does NOT wake the NV panels. Order:
-          1) wake-open-plus-empty.bin (bulk-out open + WinBoat empty chrome)
-          2) else empty-deck-bulk.bin (WinBoat raw)
+          1) wake-open-plus-empty.bin (bulk-out open + empty chrome)
+          2) else empty-deck-bulk.bin
           3) else bulk-out open-only / open actions
         """
         with self._wake_lock:
@@ -1596,8 +1596,8 @@ class NvScreensDaemon:
 
             # 1) Full clean wake from VDJ_start_stop_sequence (empty Controllers)
             for label, path in (
-                ("winusb-empty-shell", WAKE_FULL_BIN),
-                ("winusb-open-only", WAKE_OPEN_ONLY_BIN),
+                ("empty-shell", WAKE_FULL_BIN),
+                ("open-only", WAKE_OPEN_ONLY_BIN),
                 ("hybrid-fallback", WAKE_HYBRID_BIN),
             ):
                 if path.is_file() and self.wake_mode not in ("full", "all", "session"):
@@ -1635,7 +1635,7 @@ class NvScreensDaemon:
             print(f"[nv] LCD sysex wake (weak) ok={ok} fail={fail}", flush=True)
 
     def blank_lcds(self, *, reason: str = "shutdown") -> None:
-        """WinUSBNCap zero-chrome wipe while we still own bulk.
+        """ zero-chrome wipe while we still own bulk.
 
         Capture end: blanked 0507/0524/0521/0505… overwrites VDJ metadata.
         NOT logo SysEx — logos come from authorized re-enum after release.
@@ -1650,7 +1650,7 @@ class NvScreensDaemon:
         try:
             t0 = time.perf_counter()
             ok = fail = 0
-            # Primary: raw close-bulk from WinUSBNCap (zeroish chrome wipe)
+            # Primary: raw close-bulk from  (zeroish chrome wipe)
             if CLOSE_BULK_BIN.is_file():
                 o, f = self._play_bulk_bin(
                     CLOSE_BULK_BIN, reason=f"zero-wipe:{reason}", pace=0.0004
@@ -1768,7 +1768,7 @@ class NvScreensDaemon:
         # Default: push as fast as USB allows (hz only paces if > 0 via paint_delay)
         hz = max(self.args.paint_hz, 0.0)
         period = (1.0 / hz) if hz > 0 else 0.0
-        # Delay capture reel so startup isn't stuck on old WinBoat frames;
+        # Delay capture reel so startup isn't stuck on old frames;
         # live VDJ F0 47 should arrive first after factory displays bind.
         capture_grace_s = float(
             __import__("os").environ.get("NV_CAPTURE_GRACE_S", "12")

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Numark NV + VirtualDJ on Linux — installer (v1.1.2)
-# Multi-user safe: absolute paths, per-user desktop, no shared /tmp logs.
+# Install Numark NV + VirtualDJ Linux glue.
+# Absolute paths, per-user desktop and logs.
 set -euo pipefail
 
 if [[ -t 1 ]]; then
@@ -83,16 +83,12 @@ fi
 step 2/5 "Installing tree → $DEST"
 mkdir -p "$DEST" "$BIN"
 if [[ "$SRC" != "$DEST" ]]; then
-  for d in bin nv_screens scripts config data wine-patch docs; do
+  for d in bin nv_screens scripts config data wine-patch tools; do
     [[ -d "$SRC/$d" ]] || continue
     rm -rf "$DEST/$d"
     cp -a "$SRC/$d" "$DEST/"
     ok "copied $d"
   done
-  if [[ -d "$SRC/tools" ]]; then
-    rm -rf "$DEST/tools"
-    cp -a "$SRC/tools" "$DEST/"
-  fi
   for f in README.md LICENSE VERSION CHANGELOG.md INSTALL.md install.sh; do
     [[ -f "$SRC/$f" ]] && cp -a "$SRC/$f" "$DEST/"
   done

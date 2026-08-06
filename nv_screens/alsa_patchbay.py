@@ -8,9 +8,9 @@ Ports (application client name: "nv-screens"):
 
 NV driver facade (separate ALSA client, default on):
   client "nv-screens-facade"  (long → Wine uses port-only names)
-  ports  "NV Audio" / "NV Graphics"  (= Windows drivernames)
+  ports  "NV Audio" / "NV Graphics"  (= device names)
 
-  WinBoat: NV Audio → factory Display Left; NV Graphics → Display Right.
+  reference: NV Audio → factory Display Left; NV Graphics → Display Right.
   Real USB MIDI OUT stays libusb bulk; identity probes get product replies.
 
 NO monitor_out / log_out — those READ ports were auto-wired into
@@ -66,7 +66,7 @@ SND_SEQ_QUEUE_DIRECT = 253
 POLLIN = 0x0001
 
 # Identity replies (universal non-realtime). Product field matches USB product
-# family used in factory defs (…0206xx / 030600…). WinBoat + successful Wine
+# family used in factory defs (…0206xx / 030600…). reference + successful Wine
 # sessions map:
 #   15e4:1005 NV Control  → Numark NV          (needs serial in identity)
 #   15e4:1033 NV Audio    → NV Display Left
@@ -246,15 +246,15 @@ DEFAULT_PORTS = [
     # Intentionally NO monitor_out / log_out (READ ports auto-wire into Wine)
 ]
 
-# WinBoat ground truth (Log Report + Controllers UI):
+# Facade names for factory Controllers UI:
 #   OS drivername   VID:PID   → factory title after identify
 #   NV Control      15e4:1005 → Numark NV          (keep real kernel)
 #   NV Audio        15e4:1033 → NV Display Left
 #   NV Graphics     15e4:2033 → NV Display Right
 #
-# Windows identifies displays primarily by USB PID/VID path. Wine's winealsa
+# Devices identify displays primarily by USB PID/VID path. Wine's winealsa
 # never attaches USB paths to MIDI (hardcodes wMid=0xFF wPid=0x0001). Fallback
-# is "Identified by name" / Sysex — so facade port names MUST match Windows
+# is "Identified by name" / Sysex — so facade port names MUST match device names
 # drivernames exactly: "NV Audio" / "NV Graphics" (not "… MIDI 1").
 #
 # Custom Devices/*.xml SHADOW factory controllers.dat — do not install display
@@ -281,7 +281,7 @@ _FACADE_TYPE = (
 #   factory (default) — port names = factory Controllers titles so
 #     "Identified by name" can hit controllers.dat:
 #       NV Control / NV Display Left / NV Display Right
-#   windows — OS product strings NV Control / NV Audio / NV Graphics
+#   factory — product strings NV Control / NV Audio / NV Graphics
 #   vidpid  — embed vid_15e4&pid_XXXX for path-style PID/VID parse
 def _facade_port_specs() -> list[PortSpec]:
     mode = __import__("os").environ.get("NV_FACADE_NAME_MODE", "factory").strip().lower()
@@ -289,7 +289,7 @@ def _facade_port_specs() -> list[PortSpec]:
         ctl_name = "vid_15e4&pid_1005"
         left_name = "vid_15e4&pid_1033"
         right_name = "vid_15e4&pid_2033"
-    elif mode in ("windows", "os", "product"):
+    elif mode in ("factory", "os", "product"):
         ctl_name = "NV Control"
         left_name = "NV Audio"
         right_name = "NV Graphics"
@@ -299,7 +299,7 @@ def _facade_port_specs() -> list[PortSpec]:
         left_name = "NV Display Left"
         right_name = "NV Display Right"
     # Identities: Control needs serial. Displays use product family bytes.
-    # Successful Wine session once matched 020610 → Display Right; WinBoat PID
+    # Successful Wine session once matched 020610 → Display Right; reference PID
     # maps 1033→Left / 2033→Right. Paint bulk routes by F0 47 product field.
     return [
         PortSpec(ctl_name, _FACADE_CAPS, _FACADE_TYPE, identity=ID_CONTROL),
@@ -376,7 +376,7 @@ def ascii_graph(routes: RouteTable, *, live: dict[str, str] | None = None) -> st
     lines.append("  nv-screens:inject_in       ← optional tools")
     lines.append(
         "  nv-screens-facade-midi: NV Control / NV Audio / NV Graphics "
-        "← Windows drivernames (factory Numark NV + Display L/R)"
+        "← device names (factory Numark NV + Display L/R)"
     )
     lines.append("")
     lines.append(
@@ -1089,7 +1089,7 @@ class AlsaPatchbay:
             specs = _facade_port_specs()
             if not self.display_ports:
                 specs = specs[:1]
-            # Long client name → Wine szPname = port only (exact Windows drivernames)
+            # Long client name → Wine szPname = port only (exact device names)
             self._gfx = _SeqClient(FACADE_CLIENT_NAME)
             self._gfx.on_midi = self._dispatch_midi
             self._gfx.on_event = self._dispatch_event
@@ -1107,7 +1107,7 @@ class AlsaPatchbay:
             print(
                 f"[patchbay] NV driver facade UP client={FACADE_CLIENT_NAME!r} "
                 f"→ Wine MIDI names: {[s.name for s in specs]} "
-                f"(mode={__import__('os').environ.get('NV_FACADE_NAME_MODE', 'windows')}; "
+                f"(mode={__import__('os').environ.get('NV_FACADE_NAME_MODE', 'factory')}; "
                 f"Control identity=factory serial; libusb owns Graphics/Audio bulk)",
                 flush=True,
             )

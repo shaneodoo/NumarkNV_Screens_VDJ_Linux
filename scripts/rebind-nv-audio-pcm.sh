@@ -5,7 +5,7 @@
 #   sysfs-name e.g. 1-4.2 (from /sys/bus/usb/devices/)
 #
 # bind/unbind need root. Optional sudoers line (once):
-#   shane ALL=(root) NOPASSWD: /home/shane/src/nv-screens/scripts/rebind-nv-audio-pcm.sh
+#   USER ALL=(root) NOPASSWD: /path/to/scripts/rebind-nv-audio-pcm.sh
 set -euo pipefail
 
 log() { echo "[nv-rebind] $*"; }

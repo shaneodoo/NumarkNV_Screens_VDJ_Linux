@@ -1,14 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Fool VDJ audio hardware detector (NUMARK NV button on AUDIO tab).
-
-  VDJ log under Wine:
-    "WASAPI device without vid/pid: Out: NV Audio - USB Audio"
-  Factory button needs USB 15e4:1033. Winepulse often omits VID/PID on the
-  endpoint; winealsa can supply them from sysfs PRODUCT=15e4/1033/...
-
-  Pair with: Wine registry Drivers\Audio = "alsa" (see apply-nv-spoof.sh)
--->
+<!-- Optional VDJ Devices entry for NUMARK NV audio (USB 15e4:1033). -->
 <audio
   name="NMNVAUDIO"
   description="NUMARK NV"

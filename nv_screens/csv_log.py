@@ -1,4 +1,4 @@
-"""Append-only CSV traffic log for captures and live nv-screens I/O."""
+"""Append-only CSV traffic log for nv-screens I/O."""
 from __future__ import annotations
 
 import csv

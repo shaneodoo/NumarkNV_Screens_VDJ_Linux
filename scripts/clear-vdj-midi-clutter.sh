@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Clear VDJ custom SIMPLE_MIDI mappers that steal factory display bind,
-# and backup mapper XML. Safe to re-run.
+# Remove SIMPLE_MIDI clutter that can block factory NV display bind.
 set -euo pipefail
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
 VDJ="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ"

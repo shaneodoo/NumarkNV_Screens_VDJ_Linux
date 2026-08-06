@@ -53,7 +53,7 @@ if user_reg.exists():
         hx = [int(x, 16) for x in m.group(1).split(",") if x]
         b = bytes(hx[:16])
         if len(b) == 16:
-            # Wine GUID binary is mixed-endian like Windows
+            # Wine GUID binary is mixed-endian as usual
             d1, d2, d3 = struct.unpack("<IHH", b[:8])
             d4 = b[8:16]
             guid = (

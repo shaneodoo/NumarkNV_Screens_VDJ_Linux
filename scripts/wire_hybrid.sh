@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# Wire ALSA for hybrid Wine VDJ + nv-screens.
-#
-#   Wine ⟷ NV Control
-#   Wine ⟷ NV Audio
-#   Wine outs → nv-screens:vdj_in
-#   Wine ⟷ virtual NV Graphics  (user client — VDJ SEES Graphics)
-#   Wine ─x─ kernel NV Graphics  (real USB; only present if not claimed)
-#   Real LCD paint = libusb bulk only
+# Wire Wine MIDI to NV Control / Audio / Graphics facades and nv-screens.
 #
 set -euo pipefail
 
@@ -233,5 +226,5 @@ fi
 echo
 echo "NOTE: real LCD paint = libusb bulk (not an ALSA cable)."
 echo "      Facade → Wine: NV Control + NV Display Left + NV Display Right"
-echo "      (or NV Audio/Graphics if NV_FACADE_NAME_MODE=windows)"
+echo "      (or NV Audio/Graphics)"
 echo "      Kernel Graphics missing = exclusive claim — good."

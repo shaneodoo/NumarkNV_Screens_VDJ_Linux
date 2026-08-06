@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Stock restore for Numark NV LCDs after VDJ (WinUSBNCap finding):
+# Restore stock NV logos: optional wipe, then USB authorized 0→1 re-enum.
+# Needs root (sudo -n). Sudoers example:
+#   USER ALL=(root) NOPASSWD: /path/to/scripts/usb-reset-nv.sh
+#
+# Stock restore for Numark NV LCDs after VDJ (USB finding):
 #
 #   1) Zero-chrome bulk wipe  — overwrite VDJ metadata (0507/0521/0524/… blanked)
 #   2) authorized 0→1         — soft re-plug → firmware logos
@@ -17,8 +21,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WIPE_PY="$ROOT/scripts/nv_zero_wipe.py"
-CLOSE_BULK="$ROOT/captures/extracted-start-stop/close-bulk.bin"
+WIPE_PY="$ROOT/scripts/nv_zero_wipe.py"  # optional; skipped if missing
+CLOSE_BULK="$ROOT/data/wake/close-bulk.bin"
 
 log() { echo "[nv-usb-reset] $*"; }
 
@@ -35,7 +39,7 @@ phase_zero_wipe() {
     log "skip zero wipe — missing $WIPE_PY"
     return 0
   fi
-  log "phase 1/2: WinUSBNCap zero-chrome bulk wipe (clear VDJ metadata)"
+  log "phase 1/2: bulk wipe before re-enum"
   # Run as the invoking user when possible (script may re-exec as root)
   local pyuser="${SUDO_USER:-$USER}"
   if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then

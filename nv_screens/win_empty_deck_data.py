@@ -1,9 +1,9 @@
-"""Empty-deck open + close SysEx from VDJ_start_stop_sequence.pcapng (WinBoat).
+"""Empty-deck open + close SysEx from wake sequence .
 
 Empty phase: t~4.0–6.3 (full Controllers chrome, no track 0509).
 Close phase: t~16.3–17.2 (tear-down / zeroed status on both LCDs).
 
-AUTO-GENERATED — regenerate from captures/extracted-start-stop/empty-deck-and-close.tsv
+Empty-deck open/close bulk payloads.
 """
 from __future__ import annotations
 

@@ -20,7 +20,7 @@ End-user install polish: multi-user safe launcher + reliable desktop icon.
 ```bash
 git pull
 ./install.sh
-# then re-test as any user:  ~/bin/start-virtualdj.sh
+# then re-test as any user: ~/bin/start-virtualdj.sh
 ```
 
 ---
@@ -48,30 +48,30 @@ Second public release. Builds on **v1.0.0** (factory Controllers + live dual LCD
 
 ### What’s new since 1.0.0
 
-**Layout (breaking paths for packagers)**  
+**Layout (breaking paths for packagers)** 
 - Replaced `tools2/` + `src2/` sprawl with a clear tree:
-  - `bin/` — `nv-screens`, `start-virtualdj.sh`, `vdj-set-nv-audio.py`
-  - `nv_screens/` — Python package (patchbay, bulk paint, wake/close)
-  - `scripts/` — wire, USB reset, Wine spoof, graphics guard
-  - `config/` — udev rules + optional VDJ device XML
-  - `data/wake/` — wake / empty-deck / close bulk only
-- Public pack no longer ships captures, snapshots, or RE probes  
+ - `bin/` — `nv-screens`, `start-virtualdj.sh`, `vdj-set-nv-audio.py`
+ - `nv_screens/` — Python package (patchbay, bulk paint, wake/close)
+ - `scripts/` — wire, USB reset, Wine spoof, graphics guard
+ - `config/` — udev rules + optional VDJ device XML
+ - `data/wake/` — wake / empty-deck / close bulk only
+- Public pack no longer ships captures, snapshots, or RE probes 
 - Compat wrappers: `tools/usb-reset-nv.sh` still works for old sudoers lines
 
-**LCD / browser**  
-- Cleaner browser list scrolling on both LCDs (full 0..6 frames + careful strip-0 scroll)  
-- After LOAD, waveforms stay protected; residual browser paint doesn’t blank the deck  
-- Optional mouse → library open (see 1.1.1: off by default via `NV_MOUSE_LIBRARY_INJECT`)  
-- Pane title / list chrome (`0521`–`0524`) prioritised in the live queue  
+**LCD / browser** 
+- Cleaner browser list scrolling on both LCDs (full 0..6 frames + careful strip-0 scroll) 
+- After LOAD, waveforms stay protected; residual browser paint doesn’t blank the deck 
+- Optional mouse → library open (see 1.1.1: off by default via `NV_MOUSE_LIBRARY_INJECT`) 
+- Pane title / list chrome (`0521`–`0524`) prioritised in the live queue 
 
-**Startup / shutdown**  
-- Skip full USB re-enum on start when NV Audio/Graphics are already present (much faster relaunch)  
-- Safer close: stop patchbay before CSV teardown (no SEGV on quit)  
-- Stock logos still restored via authorized USB re-enum after exit  
+**Startup / shutdown** 
+- Skip full USB re-enum on start when NV Audio/Graphics are already present (much faster relaunch) 
+- Safer close: stop patchbay before CSV teardown (no SEGV on quit) 
+- Stock logos still restored via authorized USB re-enum after exit 
 
-**Docs**  
-- Public docs only: system picture, hybrid daily use, protocol, Wine notes  
-- `README.md` + `FILE-LIST.md` match the new tree  
+**Docs** 
+- Public docs only: system picture, hybrid daily use, protocol, Wine notes 
+- `README.md` + `FILE-LIST.md` match the new tree 
 
 ### Upgrade notes
 
@@ -93,7 +93,7 @@ Re-select **Numark NV - Custom Mapping** in VDJ (or restart VDJ) so the song/fol
 
 ### Not in this release (private / local only)
 
-Full USB captures, session snapshots, WinBoat dumps, and experimental probe scripts stay out of the public repo.
+Full USB captures, session snapshots, reference dumps, and experimental probe scripts stay out of the public repo.
 
 ---
 
@@ -101,7 +101,7 @@ Full USB captures, session snapshots, WinBoat dumps, and experimental probe scri
 
 First **public** release.
 
-- Factory Controllers: Numark NV + Display Left + Display Right under Wine  
-- Live dual LCD paint from VDJ (libusb bulk + facade MIDI)  
-- Open-only / empty-deck wake; one launcher (`start-virtualdj.sh`)  
-- Simple `./install.sh` for other Linux machines  
+- Factory Controllers: Numark NV + Display Left + Display Right under Wine 
+- Live dual LCD paint from VDJ (libusb bulk + facade MIDI) 
+- Open-only / empty-deck wake; one launcher (`start-virtualdj.sh`) 
+- Simple `./install.sh` for other Linux machines 
