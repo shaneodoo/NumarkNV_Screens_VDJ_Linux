@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0 — 2026-08-10
+
+Cleanup release: centralized USB IDs, killed a disk-filling log bug, and stopped the Wine sandbox from seeing your whole filesystem.
+
+### Added
+- **`config/nv-ids.env`** — one source of truth for the NV's USB VID/PID (`15e4` / Control `1005` / Audio `1033` / Graphics `2033`). Was duplicated across 9+ files before this.
+- **`nv_screens/ids.py`** — Python loader for the above.
+- **`tools/detect-nv.sh`** — lists connected `15e4:*` interfaces, flags anything not in `nv-ids.env`. Read-only, never writes back.
+- **`NV_LIVE_BRIDGE_LOG`** — opt-in raw MIDI/bulk capture, off by default (see Fixed).
+- **`NV_BWRAP_FULL_HOST`** — escape hatch back to the old unrestricted bwrap bind if the new list is missing something.
+
+### Fixed
+- **Log rotation wasn't actually rotating.** `trim_log()` wrote a trimmed copy to a new file and `mv`'d it over the original — but `nv-screens`' stdout and the CSV logger hold that file open for the whole gig. `mv` swaps in a new inode; the running process kept writing into the old, unlinked one. Disk usage never stopped climbing despite trimming running every 2 minutes, and the on-disk file went stale after the first trim (`tail -f` and the crash diagnostic both broke). Now truncates in place instead of swapping files.
+- **`live-bridge.txt` had no size cap** and wrote on nearly every MIDI frame, to a path different from the one actually being trimmed. Normal installs silently failed the write; a dev checkout with `captures/` present would grow it forever. Opt-in now, path fixed, self-caps regardless of the shell trimmer.
+- LED-toggle dict kept one empty entry per MIDI note/CC ever touched in a session, forever. Bounded by keyspace so never serious, but pruned now.
+
+### Changed
+- **bwrap no longer binds the whole host.** `run_wine()` used `--dev-bind / /`, exposing every mounted drive to Wine unconditionally. Now binds only what Wine/Vulkan/ALSA/USB actually need, plus whatever's configured in `winecfg`'s Drives tab — read straight from `$WINEPREFIX/dosdevices/*`, so it stays in sync on its own.
+- `config/nv-ids.env` comment rewritten to stop overpromising — it only covers USB identity, not the screen protocol. Notes how to point it at another Numark via `lsusb`; no guarantee it'll paint anything.
+
+### Upgrade
+```bash
+git pull
+./install.sh
+```
+
+If VDJ stops seeing a drive after upgrading, check it's actually mapped in `winecfg`'s Drives tab — the sandbox only sees what's there now.
+
+---
+
 ## 1.2.0 — 2026-08-06
 
 Full Linux VDJ stack: Numark NV screens **plus** portable DXVK for video.
@@ -127,4 +157,4 @@ First **public** release.
 - Factory Controllers: Numark NV + Display Left + Display Right under Wine 
 - Live dual LCD paint from VDJ (libusb bulk + facade MIDI) 
 - Open-only / empty-deck wake; one launcher (`start-virtualdj.sh`) 
-- Simple `./install.sh` for other Linux machines 
+- Simple `./install.sh` for other Linux machines
