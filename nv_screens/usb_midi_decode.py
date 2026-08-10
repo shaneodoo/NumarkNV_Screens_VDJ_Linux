@@ -38,11 +38,7 @@ CIN_NAMES = {
     0xF: "single_byte",
 }
 
-PRODUCT_NAMES = {
-    0x1005: "control",
-    0x2033: "graphics",
-    0x1033: "audio",
-}
+from nv_screens.ids import PRODUCT_NAMES  # noqa: F401  — canonical, from config/nv-ids.env
 
 
 @dataclass

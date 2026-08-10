@@ -77,15 +77,32 @@ BRIDGE_LOG="$STATE_DIR/live-bridge.txt"
 # Max size (bytes) before trim; default 1 MiB each (~few thousand lines)
 LOG_MAX_BYTES="${NV_LOG_MAX_BYTES:-1048576}"
 
-# Keep only the tail of a log if it grew past LOG_MAX_BYTES
+# Keep only the tail of a log if it grew past LOG_MAX_BYTES.
+#
+# IMPORTANT: nv-screens' stdout (NV_LOG) and the CSV logger (CSV_LOG) hold
+# a long-lived open file descriptor to these paths for the whole gig. A
+# naive "write tail to a new file, then mv over the original" swaps in a
+# *new inode* — the running process keeps appending into the OLD, now
+# unlinked inode, which (a) never actually stops growing, defeating the
+# whole point of trimming, and (b) leaves the on-disk file stale after the
+# first trim (breaks `tail -f` and the "see $NV_LOG" diagnostic on
+# failure). Truncating the SAME inode in place (plain `>` redirection,
+# which reuses the existing inode instead of creating a new one) keeps
+# any O_APPEND writer correctly appending after the new, shorter content.
 trim_log() {
-  local f="$1" max="${2:-$LOG_MAX_BYTES}" sz keep
+  local f="$1" max="${2:-$LOG_MAX_BYTES}" sz keep tmp
   [[ -f "$f" ]] || return 0
   sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
   (( sz > max )) || return 0
   keep=$(( max / 2 ))
   (( keep < 65536 )) && keep=65536
-  tail -c "$keep" "$f" >"${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "$f" || true
+  tmp=$(mktemp "${f}.XXXXXX.tmp") || return 0
+  if tail -c "$keep" "$f" >"$tmp" 2>/dev/null; then
+    # `>"$f"` truncates the EXISTING inode in place (path already exists)
+    # instead of creating a new one — do not change this to `mv`.
+    cat "$tmp" >"$f" 2>/dev/null || true
+  fi
+  rm -f "$tmp"
 }
 
 # While host runs, periodically trim state logs (long gigs)
@@ -267,11 +284,85 @@ wire_once() {
   return 1
 }
 
+# Resolve every symlink under $WINEPREFIX/dosdevices/* to its real host
+# target, deduped. This is exactly how winecfg's "Drives" tab is
+# implemented under the hood — reading it (instead of hardcoding paths)
+# means whatever you add/remove/change in winecfg is picked up
+# automatically on the next launch, and nothing beyond what YOU configured
+# there is exposed to the sandbox.
+_nv_wine_drive_targets() {
+  local prefix="$1"
+  local -A seen=()
+  local link target
+
+  [[ -d "$prefix/dosdevices" ]] || return 0
+
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f -- "$link" 2>/dev/null)" || continue
+    [[ -e "$target" ]] || continue          # dangling symlink — skip
+    [[ -n "${seen[$target]:-}" ]] && continue
+    seen[$target]=1
+    printf '%s\0' "$target"
+  done < <(find "$prefix/dosdevices" -maxdepth 1 -type l -print0 2>/dev/null)
+}
+
 run_wine() {
   if [[ -z "${NV_SKIP_WINEALSA_BWRAP:-}" && -f "$_NV_SO" && -n "$_NV_DST" && -x /usr/bin/bwrap ]]; then
+    if [[ -n "${NV_BWRAP_FULL_HOST:-}" ]]; then
+      # Escape hatch: old unrestricted behaviour (binds the ENTIRE host
+      # filesystem in). Only use this to unblock a gig if the curated bind
+      # list below is missing something it needs — then report what broke.
+      log "Wine under bwrap (winealsa only → $_NV_DST) [NV_BWRAP_FULL_HOST=1: full host bind]"
+      /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
+        wine "$EXE" "$@"
+      return $?
+    fi
+
+    # Minimal bind set: only what Wine/Vulkan/ALSA/USB and your configured
+    # winecfg drives actually need — NOT the whole host filesystem.
+    local bwrap_args=(
+      # Merged-/usr distro layout (Fedora et al.) — /lib, /lib64, /bin,
+      # /sbin are normally symlinks into /usr; recreate them so anything
+      # resolving those paths still works from inside the sandbox.
+      --symlink usr/lib     /lib
+      --symlink usr/lib64   /lib64
+      --symlink usr/bin     /bin
+      --symlink usr/sbin    /sbin
+      --ro-bind /usr        /usr
+      --ro-bind /etc        /etc
+      --proc    /proc
+      # Full real /dev passthrough — needed for GPU (Vulkan/DXVK, /dev/dri),
+      # audio (/dev/snd), and raw USB access (nv-screens' pyusb, /dev/bus/usb).
+      --dev-bind /dev       /dev
+      # Read-WRITE: scripts/usb-reset-nv.sh writes to sysfs
+      # (.../authorized) to re-enumerate the NV over USB — read-only here
+      # would silently break that.
+      --bind    /sys        /sys
+      # Wayland/X11, PipeWire/PulseAudio, and D-Bus session sockets live
+      # under /run (usually /run/user/$UID) and /tmp (X11).
+      --bind    /run        /run
+      --bind    /tmp         /tmp
+      # The Wine prefix itself (registry, drive_c, and the dosdevices
+      # symlinks we just read above).
+      --bind    "$WINEPREFIX" "$WINEPREFIX"
+    )
+
+    local drive_list=()
+    while IFS= read -r -d '' t; do
+      bwrap_args+=(--bind "$t" "$t")
+      drive_list+=("$t")
+    done < <(_nv_wine_drive_targets "$WINEPREFIX")
+
+    bwrap_args+=(--bind "$_NV_SO" "$_NV_DST" --die-with-parent)
+
     log "Wine under bwrap (winealsa only → $_NV_DST)"
-    /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
-      wine "$EXE" "$@"
+    if ((${#drive_list[@]})); then
+      log "  winecfg drives bound: ${drive_list[*]}"
+    else
+      log "  WARN: no drives resolved from $WINEPREFIX/dosdevices — VDJ may not see any files. Check winecfg's Drives tab."
+    fi
+
+    /usr/bin/bwrap "${bwrap_args[@]}" wine "$EXE" "$@"
   else
     if [[ ! -f "$_NV_SO" ]]; then
       log "WARN winealsa.so patch missing at $_NV_SO — running plain wine"

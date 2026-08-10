@@ -6,6 +6,7 @@ Wine's winealsa.drv device GUID for plughw:N,0.
 """
 from __future__ import annotations
 
+import os
 import re
 import struct
 from pathlib import Path
@@ -16,11 +17,44 @@ settings = home / ".wine/drive_c/users" / home.name / "AppData/Local/VirtualDJ/s
 if not settings.exists():
     raise SystemExit(0)
 
-# Find NV Audio card number (by usbid 15e4:1033 or id Audio + USB)
+# --- Canonical NV Audio USB identity -----------------------------------
+# This script is installed standalone (~/bin/vdj-set-nv-audio.py), so it
+# can't rely on being next to the nv_screens package. It looks for
+# config/nv-ids.env relative to itself (works when run from the install
+# tree's bin/ dir), then $NV_IDS_ENV, then falls back to the known default
+# so it still works if copied somewhere fully standalone.
+def _load_nv_audio_usbid() -> str:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "config" / "nv-ids.env",
+    ]
+    env_override = os.environ.get("NV_IDS_ENV")
+    if env_override:
+        candidates.insert(0, Path(env_override))
+    for path in candidates:
+        try:
+            values = {}
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                values[k.strip()] = v.strip()
+            vid = values.get("NV_VID")
+            pid = values.get("NV_PID_AUDIO")
+            if vid and pid:
+                return f"{vid}:{pid}".lower()
+        except OSError:
+            continue
+    return "15e4:1033"  # fallback default — kept in sync with config/nv-ids.env
+
+
+NV_AUDIO_USBID = _load_nv_audio_usbid()
+
+# Find NV Audio card number (by usbid or id Audio + USB)
 card_num: str | None = None
 for usbid in Path("/proc/asound").glob("card*/usbid"):
     try:
-        if usbid.read_text().strip().lower() == "15e4:1033":
+        if usbid.read_text().strip().lower() == NV_AUDIO_USBID:
             card_num = usbid.parent.name.replace("card", "")
             break
     except OSError:

@@ -24,6 +24,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WIPE_PY="$ROOT/scripts/nv_zero_wipe.py"  # optional; skipped if missing
 CLOSE_BULK="$ROOT/data/wake/close-bulk.bin"
 
+# Canonical USB identity — see config/nv-ids.env (single source of truth)
+# shellcheck source=/dev/null
+source "$ROOT/config/nv-ids.env"
+
 log() { echo "[nv-usb-reset] $*"; }
 
 # ---------------------------------------------------------------------------
@@ -83,7 +87,7 @@ find_dev_path() {
   local want="$1" d
   for d in /sys/bus/usb/devices/*; do
     [[ -f "$d/idVendor" && -f "$d/idProduct" ]] || continue
-    if [[ "$(cat "$d/idVendor" 2>/dev/null)" == "15e4" \
+    if [[ "$(cat "$d/idVendor" 2>/dev/null)" == "$NV_VID" \
        && "$(cat "$d/idProduct" 2>/dev/null)" == "$want" ]]; then
       echo "$d"
       return 0
@@ -96,7 +100,7 @@ reset_dev() {
   local pid="$1" name="$2" path
   path=$(find_dev_path "$pid" || true)
   if [[ -z "${path:-}" ]]; then
-    log "$name (15e4:$pid) not present — skip"
+    log "$name ($NV_VID:$pid) not present — skip"
     return 1
   fi
   log "stock re-enum $name → $(basename "$path")"
@@ -134,8 +138,8 @@ reset_dev() {
 }
 
 log "phase 2/2: authorized re-enum (Graphics + Audio) → stock logos"
-reset_dev 2033 "Graphics" || true
-reset_dev 1033 "Audio" || true
+reset_dev "$NV_PID_GRAPHICS" "Graphics" || true
+reset_dev "$NV_PID_AUDIO" "Audio" || true
 sleep 0.8
 
 log "amidi after re-enum:"

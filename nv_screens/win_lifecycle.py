@@ -21,10 +21,8 @@ On Linux we replay the MIDI halves; PCM open/close is ALSA/kernel.
 """
 from __future__ import annotations
 
-# Product IDs in F0 47 <hi> <lo> …
-PID_AUDIO = 0x1033  # Display Left + PCM
-PID_GRAPHICS = 0x2033  # Display Right
-PID_CONTROL = 0x1005
+# Product IDs in F0 47 <hi> <lo> … — canonical values from config/nv-ids.env
+from nv_screens.ids import PID_AUDIO, PID_GRAPHICS, PID_CONTROL  # noqa: E402,F401
 
 # --- Open (frame ~381+): 0506 then 0508 per product ---
 OPEN_LEFT: list[bytes] = [

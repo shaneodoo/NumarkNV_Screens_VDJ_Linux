@@ -65,6 +65,13 @@ SND_SEQ_QUEUE_DIRECT = 253
 
 POLLIN = 0x0001
 
+from nv_screens.ids import (  # noqa: E402
+    VID_HEX,
+    PID_CONTROL_HEX,
+    PID_AUDIO_HEX,
+    PID_GRAPHICS_HEX,
+)
+
 # Identity replies (universal non-realtime). Product field matches USB product
 # family used in factory defs (…0206xx / 030600…). reference + successful Wine
 # sessions map:
@@ -286,9 +293,9 @@ _FACADE_TYPE = (
 def _facade_port_specs() -> list[PortSpec]:
     mode = __import__("os").environ.get("NV_FACADE_NAME_MODE", "factory").strip().lower()
     if mode in ("vidpid", "vid_pid", "pidvid"):
-        ctl_name = "vid_15e4&pid_1005"
-        left_name = "vid_15e4&pid_1033"
-        right_name = "vid_15e4&pid_2033"
+        ctl_name = f"vid_{VID_HEX}&pid_{PID_CONTROL_HEX}"
+        left_name = f"vid_{VID_HEX}&pid_{PID_AUDIO_HEX}"
+        right_name = f"vid_{VID_HEX}&pid_{PID_GRAPHICS_HEX}"
     elif mode in ("factory", "os", "product"):
         ctl_name = "NV Control"
         left_name = "NV Audio"
@@ -504,7 +511,7 @@ class _SeqClient:
         # vidpid mode uses different port name
         if port_id is None:
             for n, p in self.ports.items():
-                if "Control" in n or "1005" in n:
+                if "Control" in n or PID_CONTROL_HEX in n:
                     port_id = p
                     control_port_name = n
                     break
@@ -898,7 +905,7 @@ class _SeqClient:
                     # rebroadcast from facade (VDJ binds NMNV to facade only).
                     is_ctl = (
                         port_name == "NV Control"
-                        or "1005" in port_name
+                        or PID_CONTROL_HEX in port_name
                         or (
                             "Control" in port_name
                             and "MIDI" not in port_name
@@ -1174,7 +1181,7 @@ class AlsaPatchbay:
         if port is None:
             # factory name modes
             for k, v in self.gfx_ports.items():
-                if "control" in k.lower() or "1005" in k.lower():
+                if "control" in k.lower() or PID_CONTROL_HEX in k.lower():
                     port = v
                     break
         if port is None:

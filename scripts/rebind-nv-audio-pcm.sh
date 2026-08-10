@@ -8,10 +8,15 @@
 #   USER ALL=(root) NOPASSWD: /path/to/scripts/rebind-nv-audio-pcm.sh
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Canonical USB identity — see config/nv-ids.env (single source of truth)
+# shellcheck source=/dev/null
+source "$ROOT/config/nv-ids.env"
+
 log() { echo "[nv-rebind] $*"; }
 
 # Already have PCM + MIDI?
-if grep -q '15e4:1033' /proc/asound/card*/usbid 2>/dev/null \
+if grep -q "${NV_VID}:${NV_PID_AUDIO}" /proc/asound/card*/usbid 2>/dev/null \
   && amidi -l 2>/dev/null | grep -qi 'NV Audio'; then
   log "PCM + NV Audio MIDI already present"
   exit 0
@@ -24,7 +29,7 @@ if [[ -z "$DEV" ]]; then
     [[ -f "$d/idVendor" && -f "$d/idProduct" ]] || continue
     v=$(cat "$d/idVendor" 2>/dev/null || true)
     p=$(cat "$d/idProduct" 2>/dev/null || true)
-    if [[ "$v" == "15e4" && "$p" == "1033" ]]; then
+    if [[ "$v" == "$NV_VID" && "$p" == "$NV_PID_AUDIO" ]]; then
       DEV=$(basename "$d")
       break
     fi
@@ -64,8 +69,8 @@ for ifn in 0 2; do
   }
 done
 sleep 0.4
-if grep -q '15e4:1033' /proc/asound/card*/usbid 2>/dev/null; then
-  card=$(grep -l '15e4:1033' /proc/asound/card*/usbid | head -1 | sed 's|.*/card||;s|/usbid||')
+if grep -q "${NV_VID}:${NV_PID_AUDIO}" /proc/asound/card*/usbid 2>/dev/null; then
+  card=$(grep -l "${NV_VID}:${NV_PID_AUDIO}" /proc/asound/card*/usbid | head -1 | sed 's|.*/card||;s|/usbid||')
   log "PCM restored card$card ($DEV)"
   exit 0
 fi

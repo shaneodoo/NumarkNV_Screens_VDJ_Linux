@@ -1183,6 +1183,13 @@ class NvScreensDaemon:
                     cutoff = now - 0.90
                     while times and times[0] < cutoff:
                         times.pop(0)
+                    if not times:
+                        # Nothing left for this key — drop it instead of
+                        # leaving an empty list to sit in the dict for the
+                        # rest of the session (unbounded growth over a
+                        # long gig as more distinct pads/knobs get hit).
+                        self._led_toggle_times.pop(key, None)
+                        return
                     if len(times) < 6:
                         return
                     if len(times) >= 3:
@@ -1381,24 +1388,58 @@ class NvScreensDaemon:
                         )
                         self.mark_activity()
 
-                    # Human-readable live stream (tail -f captures/live-bridge.txt)
+                    # Human-readable live stream (tail -f live-bridge.txt) — off
+                    # by default. This runs on ~every incoming frame with no
+                    # size cap of its own; previously it wrote to
+                    # captures/live-bridge.txt (gitignored, doesn't exist on a
+                    # normal install — every write silently failed) while
+                    # start-virtualdj.sh's trimmer trimmed a *different*,
+                    # unwritten $STATE_DIR path. On a dev checkout where
+                    # captures/ DOES exist, that meant genuinely unbounded,
+                    # untrimmed, per-event disk growth for the whole session.
+                    # Now opt-in (matches NV_CSV_LOG's pattern), defaults into
+                    # the same state dir as the other capped logs, and caps
+                    # itself defensively even if the shell trimmer isn't
+                    # running (e.g. nv-screens launched directly).
                     if self.stop.is_set():
                         return
-                    try:
-                        live_path = ROOT / "captures/live-bridge.txt"
-                        with live_path.open("a", encoding="utf-8") as lf:
-                            hx = raw.hex()
-                            if len(hx) > 96:
-                                hx = hx[:96] + "…"
-                            side_l = "R" if is_right else "L"
-                            ts = time.time()
-                            lf.write(
-                                f"{time.strftime('%H:%M:%S', time.localtime(ts))}"
-                                f".{int((ts % 1) * 1000):03d} {kind} {side_l} "
-                                f"cmd={cmd or '-'} len={len(raw)} {hx}\n"
+                    if os.environ.get("NV_LIVE_BRIDGE_LOG", "").strip() in (
+                        "1", "true", "yes", "on",
+                    ):
+                        try:
+                            live_path = Path(
+                                os.environ.get("NV_LIVE_BRIDGE_PATH")
+                                or (
+                                    Path(
+                                        os.environ.get("XDG_STATE_HOME")
+                                        or (Path.home() / ".local/state")
+                                    )
+                                    / "nv-screens"
+                                    / "live-bridge.txt"
+                                )
                             )
-                    except Exception:
-                        pass
+                            live_path.parent.mkdir(parents=True, exist_ok=True)
+                            # Defensive self-cap: if the shell trimmer isn't
+                            # running this session, don't grow unbounded.
+                            try:
+                                if live_path.stat().st_size > 2 * 1024 * 1024:
+                                    tail = live_path.read_bytes()[-1024 * 1024:]
+                                    live_path.write_bytes(tail)
+                            except OSError:
+                                pass
+                            with live_path.open("a", encoding="utf-8") as lf:
+                                hx = raw.hex()
+                                if len(hx) > 96:
+                                    hx = hx[:96] + "…"
+                                side_l = "R" if is_right else "L"
+                                ts = time.time()
+                                lf.write(
+                                    f"{time.strftime('%H:%M:%S', time.localtime(ts))}"
+                                    f".{int((ts % 1) * 1000):03d} {kind} {side_l} "
+                                    f"cmd={cmd or '-'} len={len(raw)} {hx}\n"
+                                )
+                        except Exception:
+                            pass
 
                     if self._vdj_csv:
                         try:

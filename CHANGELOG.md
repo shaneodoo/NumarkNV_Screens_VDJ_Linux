@@ -157,4 +157,4 @@ First **public** release.
 - Factory Controllers: Numark NV + Display Left + Display Right under Wine 
 - Live dual LCD paint from VDJ (libusb bulk + facade MIDI) 
 - Open-only / empty-deck wake; one launcher (`start-virtualdj.sh`) 
-- Simple `./install.sh` for other Linux machines
+- Simple `./install.sh` for other Linux machines 

@@ -7,8 +7,7 @@ Empty-deck open/close bulk payloads.
 """
 from __future__ import annotations
 
-PID_AUDIO = 0x1033
-PID_GRAPHICS = 0x2033
+from nv_screens.ids import PID_AUDIO, PID_GRAPHICS  # noqa: F401
 
 def _b(h: str) -> bytes:
     return bytes.fromhex(h)

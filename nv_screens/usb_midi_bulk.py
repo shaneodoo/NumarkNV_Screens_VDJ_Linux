@@ -16,10 +16,14 @@ from typing import Callable, Iterable
 import usb.core
 import usb.util
 
-VID = 0x15E4
-PID_GRAPHICS = 0x2033
-PID_AUDIO = 0x1033
-PID_CONTROL = 0x1005
+from nv_screens.ids import (  # noqa: F401
+    VID,
+    PID_AUDIO,
+    PID_GRAPHICS,
+    PID_CONTROL,
+    VID_HEX,
+    PID_AUDIO_HEX,
+)
 
 # Default paint targets (Control stays free for VDJ pads/jogs).
 DEFAULT_PAINT_PIDS = (PID_GRAPHICS, PID_AUDIO)
@@ -211,9 +215,9 @@ class NvBulkPainter:
         for pid in self.want:
             dev = usb.core.find(idVendor=VID, idProduct=pid)
             if dev is None:
-                print(f"[nv] missing 15e4:{pid:04x}", flush=True)
+                print(f"[nv] missing {VID_HEX}:{pid:04x}", flush=True)
                 continue
-            # reference: Audio 1033 = Display Left, Graphics 2033 = Display Right.
+            # reference: Audio = Display Left, Graphics = Display Right (see config/nv-ids.env).
             # Graphics: exclusive (hide ALSA; facade presents "NV Graphics").
             # Audio: MIDI bulk only — hide Audio *MIDI* (facade "NV Audio") but
             # keep PCM for Wine/VDJ sound + NUMARK NV audio button.
@@ -234,7 +238,7 @@ class NvBulkPainter:
                 else "exclusive (facade = NV Graphics / Display Right)"
             )
             print(
-                f"[nv] claimed 15e4:{pid:04x} if={ifn} ep=0x{ep:02x} "
+                f"[nv] claimed {VID_HEX}:{pid:04x} if={ifn} ep=0x{ep:02x} "
                 f"detached={detached} ({mode})",
                 flush=True,
             )
@@ -256,10 +260,10 @@ class NvBulkPainter:
         import os
         import time as _time
 
-        # Already have a card with usbid 15e4:1033?
+        # Already have a card with the expected NV Audio usbid?
         for usbid in Path("/proc/asound").glob("card*/usbid"):
             try:
-                if usbid.read_text().strip().lower() == "15e4:1033":
+                if usbid.read_text().strip().lower() == f"{VID_HEX}:{PID_AUDIO_HEX}":
                     print(
                         f"[nv] NV Audio PCM still present ({usbid.parent.name})",
                         flush=True,
@@ -283,8 +287,8 @@ class NvBulkPainter:
                     d / "devnum"
                 ).read_text().strip() == str(addr):
                     if (d / "idProduct").read_text().strip().lower() in (
-                        "1033",
-                        "0x1033",
+                        PID_AUDIO_HEX,
+                        f"0x{PID_AUDIO_HEX}",
                     ):
                         devpath = d
                         break
@@ -336,7 +340,7 @@ class NvBulkPainter:
         _time.sleep(0.3)
         for usbid in Path("/proc/asound").glob("card*/usbid"):
             try:
-                if usbid.read_text().strip().lower() == "15e4:1033":
+                if usbid.read_text().strip().lower() == f"{VID_HEX}:{PID_AUDIO_HEX}":
                     print(
                         f"[nv] NV Audio PCM restored → {usbid.parent.name}",
                         flush=True,
@@ -452,7 +456,7 @@ class NvBulkPainter:
             has_g = "NV Graphics" in out or "Graphics" in out
             has_a = "NV Audio" in out
             has_pcm = any(
-                p.read_text().strip().lower() == "15e4:1033"
+                p.read_text().strip().lower() == f"{VID_HEX}:{PID_AUDIO_HEX}"
                 for p in Path("/proc/asound").glob("card*/usbid")
                 if p.is_file()
             )
