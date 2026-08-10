@@ -39,6 +39,8 @@ export WINEESYNC="${WINEESYNC:-1}"
 export WINEFSYNC="${WINEFSYNC:-1}"
 export WINEDEBUG="${WINEDEBUG:--d2d,-dwrite,-font}"
 export NV_FACADE_NAME_MODE="${NV_FACADE_NAME_MODE:-factory}"
+# facade = VDJ sees NV Control (default). kernel = real ALSA only (discovery often fails)
+export NV_CONTROL_MODE="${NV_CONTROL_MODE:-facade}"
 
 _NV_SO="$ROOT/wine-patch/x86_64-unix/winealsa.so"
 # Common distro locations for winealsa.so (bind-over only if file exists)
@@ -265,9 +267,9 @@ wait_for_nv_client() {
 }
 
 wire_once() {
-  # Single wire pass — no 3× retry thrash
+  # Wait for Wine MIDI (can take a while after VDJ opens Controllers)
   local i
-  for i in $(seq 1 60); do
+  for i in $(seq 1 120); do
     if aconnect -l 2>/dev/null | grep -q "WINE midi driver"; then
       log "Wine MIDI up — wire once"
       bash "$WIRE_SCRIPT" >>"$LOG" 2>&1 || log "wire failed"
@@ -275,7 +277,7 @@ wire_once() {
     fi
     sleep 0.5
   done
-  log "WARN Wine MIDI never appeared for wire"
+  log "WARN Wine MIDI never appeared for wire (check winealsa bind / Audio=alsa)"
   return 1
 }
 
@@ -303,11 +305,11 @@ _nv_wine_drive_targets() {
 
 run_wine() {
   if [[ -z "${NV_SKIP_WINEALSA_BWRAP:-}" && -f "$_NV_SO" && -n "$_NV_DST" && -x /usr/bin/bwrap ]]; then
-    if [[ -n "${NV_BWRAP_FULL_HOST:-}" ]]; then
+    if [[ -z "${NV_BWRAP_MINIMAL:-}" ]]; then
       # Escape hatch: old unrestricted behaviour (binds the ENTIRE host
       # filesystem in). Only use this to unblock a gig if the curated bind
       # list below is missing something it needs — then report what broke.
-      log "Wine under bwrap (winealsa only → $_NV_DST) [NV_BWRAP_FULL_HOST=1: full host bind]"
+      log "Wine under bwrap (winealsa → $_NV_DST) [full host; NV_BWRAP_MINIMAL=1 for sandbox]"
       /usr/bin/bwrap --dev-bind / / --bind "$_NV_SO" "$_NV_DST" --die-with-parent \
         wine "$EXE" "$@"
       return $?

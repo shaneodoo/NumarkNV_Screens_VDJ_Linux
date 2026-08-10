@@ -121,19 +121,12 @@ for i in "${WINE_OUTS[@]}"; do
   fi
 done
 
-# Optional: one wine out → vdj_in for logging only (first out). Prefer facade ports for paint.
-if ((${#WINE_OUTS[@]} > 0)); then
-  soft_conn "${WINE}:${WINE_OUTS[0]}" "${NVS}:0"
-fi
-
-# --- Facade 1:1: Wine outs in device order = Control, Display Left, Display Right ---
-# winealsa (after junk filter) exposes exactly those three in open order.
+# --- Facade 1:1: Wine outs = Control, Display Left, Display Right ---
+# Do NOT also wire Control (out 0) into vdj_in (double-handled LEDs).
 if [[ -n "${GFX_USER:-}" ]]; then
-  # facade → Wine input (identity + HW control rebroadcast)
   for p in 0 1 2; do
     soft_conn "${GFX_USER}:$p" "${WINE}:0"
   done
-  # 1:1 wine output → facade port (do NOT mesh)
   map_n=${#WINE_OUTS[@]}
   for idx in 0 1 2; do
     if (( idx < map_n )); then
@@ -141,7 +134,13 @@ if [[ -n "${GFX_USER:-}" ]]; then
       echo "  map Wine:${WINE_OUTS[$idx]} → facade:$idx"
     fi
   done
-  echo "Wine ⟷ facade 1:1 (Control / Display Left / Display Right)"
+  # Paint SysEx taps: Display outs only
+  for idx in 1 2; do
+    if (( idx < map_n )); then
+      soft_conn "${WINE}:${WINE_OUTS[$idx]}" "${NVS}:0"
+    fi
+  done
+  echo "Wine ⟷ facade 1:1 (Control + Display L/R)"
 else
   echo "NOTE: no nv-screens-facade client yet (start nv-screens --patchbay)"
   for i in "${WINE_OUTS[@]}"; do
@@ -150,29 +149,33 @@ else
   echo "Wine outs → nv-screens:vdj_in (no facade)"
 fi
 
-# Kernel Control: with facade, Wine must NOT seq-link kernel Control.
-# HW jogs/pads/FX knobs: kernel → facade rebroadcast → Wine (same client as
-# factory NMNV). Direct Wine↔kernel would deliver the wrong client id and
-# double LEDs/jogs if both paths were live.
+# Kernel Control — proven working topology (user-confirmed in qpwgraph):
+#   kernel CTL → facade:0     (HW jogs/pads into facade → Wine)
+#   Wine Control out → kernel CTL  (LEDs; missing this = no lights)
+#   Wine Control out → facade:0    (already mapped above 1:1)
+# Do NOT reverse facade→kernel (echo). Do NOT mesh all Wine outs to kernel.
 if [[ -n "${CTL:-}" ]]; then
-  # Prefer kernel client id (not a user client that happens to match the name)
   CTL_K=$(find_kernel_client "NV Control")
   CTL_ISO="${CTL_K:-$CTL}"
+  # Clear any bad links first
   for i in 0 1 2 3 4 5 6 7 8 9; do
     disc "${WINE}:$i" "${CTL_ISO}:0"
     disc "${CTL_ISO}:0" "${WINE}:$i"
   done
   if [[ -n "${GFX_USER:-}" ]]; then
-    # Re-assert kernel ↔ facade Control (patchbay also does this on open;
-    # re-wire after Wine appears so FX knobs/jogs stay bridged).
+    disc "${GFX_USER}:0" "${CTL_ISO}:0"
     soft_conn "${CTL_ISO}:0" "${GFX_USER}:0"
-    soft_conn "${GFX_USER}:0" "${CTL_ISO}:0"
-    echo "Kernel NV Control isolated from Wine; linked ↔ facade:0 (FX knobs/jogs)"
+    # Control stream = first Wine ALSA Output → real hardware LEDs
+    if ((${#WINE_OUTS[@]} > 0)); then
+      soft_conn "${WINE}:${WINE_OUTS[0]}" "${CTL_ISO}:0"
+      echo "  map Wine:${WINE_OUTS[0]} → kernel NV Control (LEDs)"
+    fi
+    echo "Kernel NV Control: HW→facade + Wine Control out→kernel (LEDs)"
   else
-    conn "${CTL_ISO}:0" "${WINE}:0"
-    for i in "${WINE_OUTS[@]}"; do
-      conn "${WINE}:$i" "${CTL_ISO}:0"
-    done
+    soft_conn "${CTL_ISO}:0" "${WINE}:0"
+    if ((${#WINE_OUTS[@]} > 0)); then
+      soft_conn "${WINE}:${WINE_OUTS[0]}" "${CTL_ISO}:0"
+    fi
     echo "Wine ⟷ kernel Control (no facade)"
   fi
 fi

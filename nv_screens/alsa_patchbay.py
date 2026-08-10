@@ -537,15 +537,15 @@ class _SeqClient:
             return False
         self._ctl_kern_client = kern_id
         self._ctl_port_id = port_id
-        # receive hardware → our port; send our port → hardware
+        # Hardware → facade only. Wine→LED is a single _forward_raw_to_kernel_control.
+        # Reverse ALSA link + rebroadcast echoed MIDI and flashed LEDs off.
         e1 = _asound.snd_seq_connect_from(self._seq, port_id, kern_id, 0)
-        e2 = _asound.snd_seq_connect_to(self._seq, port_id, kern_id, 0)
         print(
-            f"[patchbay] Control bridge facade:{control_port_name!r}({port_id}) "
-            f"↔ kernel {kern_id}:0 (from={e1} to={e2})",
+            f"[patchbay] Control bridge kernel {kern_id}:0 → facade:"
+            f"{control_port_name!r}({port_id}) (from={e1}; LED=single forward)",
             flush=True,
         )
-        return e1 >= 0 or e2 >= 0
+        return e1 >= 0
 
     def _raw_to_seq_event(self, raw: bytes) -> _SndSeqEvent | None:
         """Build a fixed-length ALSA seq event from short raw MIDI bytes."""
@@ -962,28 +962,28 @@ class _SeqClient:
                                     flush=True,
                                 )
                             continue
-                        # Wine → hardware Control LEDs/etc.
-                        if not self._is_identity_request(raw):
-                            # Host hook: detect software browser focus (LED blink)
-                            owc = getattr(self, "on_wine_control", None)
-                            if owc is not None and raw and raw[0] != 0xF0:
-                                try:
-                                    owc(raw)
-                                except Exception:
-                                    pass
-                                n_wc = self.stats.get("ctl_wine", 0) + 1
-                                self.stats["ctl_wine"] = n_wc
-                                if n_wc <= 12 or n_wc % 500 == 0:
-                                    print(
-                                        f"[patchbay] ctl Wine→LED #{n_wc} "
-                                        f"hex={raw[:6].hex()}",
-                                        flush=True,
-                                    )
+                        # Wine → Control LEDs: delivered by ALSA
+                        #   aconnect Wine:ControlOut → kernel NV Control
+                        # (see wire_hybrid.sh). Do NOT also _forward_raw here
+                        # or LEDs get every message twice.
+                        if src_cli is not None and src_cli == self.client_id:
+                            continue  # ignore our own HW rebroadcast
+                        if self._is_identity_request(raw):
+                            continue
+                        owc = getattr(self, "on_wine_control", None)
+                        if owc is not None and raw and raw[0] != 0xF0:
                             try:
-                                self._forward_raw_to_kernel_control(dest, raw)
-                            except Exception as e:
-                                if self.stats["events"] <= 5:
-                                    print(f"[patchbay] ctl forward err: {e}", flush=True)
+                                owc(raw)
+                            except Exception:
+                                pass
+                        n_wc = self.stats.get("ctl_wine", 0) + 1
+                        self.stats["ctl_wine"] = n_wc
+                        if n_wc <= 12 or n_wc % 500 == 0:
+                            print(
+                                f"[patchbay] ctl Wine→LED #{n_wc} "
+                                f"hex={raw[:6].hex()} (alsa wire)",
+                                flush=True,
+                            )
                         continue
 
                     elif raw and (raw[0] & 0xF0) == 0xB0:

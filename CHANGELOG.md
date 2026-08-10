@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.1 — 2026-08-10
+
+Controller LEDs and MIDI wiring fix. Screens already painted; buttons/LEDs were flaky because the Control path was half-connected.
+
+### Fixed
+- **LEDs not staying on / Control felt broken under the facade.** Wine was talking to the virtual "NV Control" port, but the **real** kernel NV Control was not getting the LED stream. You had to drag a cable in qpwgraph by hand. `wire_hybrid.sh` now always links the first Wine ALSA Output → kernel NV Control for lights, while hardware jogs still go kernel → facade → Wine.
+- **Double MIDI on the Control path** (messages sent twice, lights flash on then off). The host no longer also re-forwards every LED byte in Python when ALSA is already doing that job.
+- **Facade ↔ kernel Control is one-way the right way:** hardware into the facade only; no reverse echo loop.
+
+### How Control is wired now
+```
+kernel NV Control  →  facade "NV Control"  →  Wine   (jogs, pads, knobs)
+Wine Control out   →  facade "NV Control"         (VDJ sees the device)
+Wine Control out   →  kernel NV Control           (LEDs on the deck)
+```
+
+### Upgrade
+```bash
+git pull
+./install.sh
+# fully quit VirtualDJ, then:
+start-virtualdj.sh
+```
+
+You should not need to re-draw MIDI cables in qpwgraph after this.
+
+---
+
 ## 1.3.0 — 2026-08-10
 
 Cleanup release: centralized USB IDs, killed a disk-filling log bug, and stopped the Wine sandbox from seeing your whole filesystem.
