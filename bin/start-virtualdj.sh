@@ -131,11 +131,6 @@ trim_log "$LOG"
 log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; trim_log "$LOG"; }
 log "=== desktop launch === ROOT=$ROOT user=$USER log_max=${LOG_MAX_BYTES}"
 
-FAV="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/Folders/DJ.vdjfolder"
-if [[ -d "$WINEPREFIX" ]]; then
-  mkdir -p "$(dirname "$FAV")" 2>/dev/null || true
-  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<FavoriteFolder path="D:\DJ" />' > "$FAV" 2>/dev/null || true
-fi
 python3 "${ROOT}/bin/vdj-set-nv-audio.py" 2>/dev/null || true
 
 kill_by_pidfile() {
