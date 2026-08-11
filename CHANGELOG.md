@@ -24,8 +24,6 @@ git pull
 start-virtualdj.sh
 ```
 
-You should not need to re-draw MIDI cables in qpwgraph after this.
-
 ---
 
 ## 1.3.0 — 2026-08-10
