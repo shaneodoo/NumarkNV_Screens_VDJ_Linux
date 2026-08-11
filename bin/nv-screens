@@ -1017,10 +1017,18 @@ class NvScreensDaemon:
                     display_ports=dports,
                 )
                 self.patchbay.open()
-                vdj_csv_path = Path(self.args.vdj_csv or (ROOT / "captures/vdj-from-wine.csv"))
-                self._vdj_csv = CsvTrafficLog(vdj_csv_path, max_hex=256)
+                # VDJ traffic CSV is OPT-IN only (--vdj-csv PATH or NV_CSV_LOG=1
+                # via start-virtualdj). Defaulting to captures/*.csv filled disks
+                # during long sessions with no size cap.
+                vdj_csv_path = None
+                self._vdj_csv = None
+                if getattr(self.args, "vdj_csv", None):
+                    vdj_csv_path = Path(self.args.vdj_csv)
+                    self._vdj_csv = CsvTrafficLog(vdj_csv_path, max_hex=256)
 
                 def _on_event(row: dict) -> None:
+                    if not self._vdj_csv:
+                        return
                     row.setdefault("direction", "wine_to_nv")
                     try:
                         self._vdj_csv.write(row)
@@ -1234,159 +1242,101 @@ class NvScreensDaemon:
 
                 def _on_midi(port: str, raw: bytes) -> None:
                     """
-                    Wine → facade port → USB-MIDI bulk (correct product per display).
+                    Wine → facade → USB-MIDI bulk: pass through EVERYTHING VDJ
+                    sends on display ports (SysEx and short MIDI). No coalesce,
+                    no soft-drop, no metadata throttle — arcs/FX on-off need
+                    every tile VDJ emits.
 
-                    Display Left  → force product 15e4:1033 (0x10 0x33)
-                    Display Right → force product 15e4:2033 (0x20 0x33)
-                    Also accept F0 47 display product SysEx from any port (mis-route).
+                    Display Left / NV Audio  → 15e4:1033
+                    Display Right / NV Graphics → 15e4:2033
+                    F0 47 with product 10/20 on any port still routes by product.
+                    Control-only traffic (non-display, non-10/20) is not painted.
                     """
                     if not raw:
                         return
                     port_l = (port or "").lower()
                     is_left = "left" in port_l or (
-                        "audio" in port_l and "midi" not in port_l and "display" not in port_l
+                        "audio" in port_l
+                        and "midi" not in port_l
+                        and "display" not in port_l
                     )
                     is_right = "right" in port_l or "graphics" in port_l
                     is_display = is_left or is_right or "display" in port_l
 
-                    if raw[0] != 0xF0:
-                        return  # never short-MIDI to LCD bulk
-                    if raw[-1:] != b"\xf7" or len(raw) < 6:
+                    is_numark = (
+                        len(raw) >= 4 and raw[0] == 0xF0 and raw[1] == 0x47
+                    )
+
+                    # Incomplete SysEx: wait for full F0…F7 (short MIDI OK as-is)
+                    if raw[0] == 0xF0 and (raw[-1:] != b"\xf7" or len(raw) < 4):
                         return
 
-                    is_numark = len(raw) >= 4 and raw[1] == 0x47
-                    # Catch display paint that arrived on Control/vdj_in
                     if not is_display:
-                        if not is_numark or len(raw) < 4:
+                        if not is_numark:
                             return
-                        # Product bytes: 0x10 0x33 = Audio/Left, 0x20 0x33 = Graphics/Right
                         prod = raw[2]
                         if prod == 0x10:
                             is_left, is_right, is_display = True, False, True
                         elif prod == 0x20:
                             is_left, is_right, is_display = False, True, True
                         else:
-                            return  # Control 0x1005 etc. — not LCD paint
+                            return  # e.g. Control product — not LCD
 
-                    cmd = raw[4:6].hex()
-                    if allow_set and not is_numark and cmd not in allow_set:
-                        return
-                    now = time.perf_counter()
-                    if cmd in metadata_cmds and not is_numark:
-                        last = last_sent.get(cmd, 0.0)
-                        if (now - last) < throttle_s:
-                            return
-                        last_sent[cmd] = now
-
-                    # Route by facade PORT when known; product bytes only for mis-routes.
                     if is_right:
                         pids = [PID_GRAPHICS]
                     else:
                         pids = [PID_AUDIO]
 
-                    bulk = sysex_to_usb_midi(raw)
-                    kind = "sysex_forwarded"
+                    # Pack exactly as USB-MIDI cells (SysEx or short channel msgs)
+                    bulk = midi_to_usb_midi(raw)
+                    if not bulk:
+                        return
+
                     if is_numark and len(raw) > 32:
                         self._live_paint_until = time.perf_counter() + 2.0
 
-                    cmd_l = (cmd or "").lower()
+                    # Optional allow-list: only when user passes --allow-sysex.
+                    # Default is empty = forward all Numark display SysEx (track
+                    # load needs 0509 + 0507 + 0521 + browser 0524, not a short list).
+                    if allow_set and is_numark and len(raw) >= 6:
+                        cmd = raw[4:6].hex().lower()
+                        if cmd and cmd not in allow_set:
+                            return
+
+                    cmd_l = raw[4:6].hex().lower() if is_numark and len(raw) >= 6 else ""
                     side = "R" if is_right else "L"
                     now_pc = time.perf_counter()
 
-                    # Always paint browser list/title VDJ sends (mouse OR knob).
-                    # Always paint protected waveforms. Only skip mirror flood
-                    # on the other LCD for ~350ms after a real knob turn.
-                    with self._browse_side_lock:
-                        knob_age = now_pc - self._browse_knob_t
-                        want = self._browse_paint_side
-
-                    _browser_ui = cmd_l in (
-                        "0524", "0523", "0522", "0521", "0520",
-                    )
-                    _deck_paint = cmd_l in (
-                        "0509", "0531", "0507", "0501", "0502",
-                    ) and len(raw) > 80
-
-                    if _browser_ui:
+                    # Book-keeping only (never skip the paint below)
+                    if cmd_l in ("0524", "0523", "0522", "0521", "0520"):
                         with self._browse_side_lock:
-                            if (
-                                cmd_l == "0524"
-                                and want is not None
-                                and side != want
-                                and knob_age <= 0.35
-                            ):
-                                self._browser_asm.frames_skipped += 1
-                                return
-                            if want != side:
-                                self._browse_paint_side = side
+                            self._browse_paint_side = side
                             self._browse_focus_t = now_pc
                         self._lcd_content_mode = "browser"
                         self._browser_until = now_pc + 0.55
                         self._last_browser_paint_t = now_pc
-
                         if cmd_l == "0524" and len(raw) > 10:
                             strip = int(raw[10])
                             _cache_browser_tile(side, cmd_l, bulk, pids, strip)
-                            # IMMEDIATE per-strip paint (mouse + knob).
-                            self.pass_q.put(
-                                (bulk, pids), priority=True, protect=True
-                            )
+                            # Still assemble full frames as EXTRA paints (passthrough
+                            # of the original strip is always queued first below).
                             for fr_side, frame in self._browser_asm.push(
                                 side, strip, bulk, pids
                             ):
                                 self.pass_q.put_browser_frame(fr_side, frame)
                         else:
                             _cache_browser_tile(side, cmd_l, bulk, pids, None)
-                            self.pass_q.put(
-                                (bulk, pids),
-                                priority=True,
-                                protect=True,
-                                coalesce_key=(
-                                    cmd_l,
-                                    side,
-                                    raw[10] if len(raw) > 10 else 0,
-                                    pids[0] if pids else 0,
-                                ),
-                            )
-                        self.mark_activity()
+                    elif cmd_l in ("0509", "0531", "0507", "0501", "0502") and len(raw) > 80:
+                        self._lcd_content_mode = "deck"
+                        self._deck_enter_t = now_pc
 
-                    elif _deck_paint:
-                        # Don't stomp browser if software browser focus is hot
-                        sw_age = now_pc - self._sw_browser_focus_t
-                        if sw_age < 1.2 and cmd_l == "0509":
-                            # Soft-drop waveform tiles while mouse-browsing
-                            self.mark_activity()
-                        else:
-                            if cmd_l in ("0501", "0502", "0531") and len(raw) > 80:
-                                if self._lcd_content_mode != "deck":
-                                    print(
-                                        f"[nv] deck view (cmd={cmd_l})",
-                                        flush=True,
-                                    )
-                                self._lcd_content_mode = "deck"
-                                self._deck_enter_t = now_pc
-                            self.pass_q.put(
-                                (bulk, pids),
-                                priority=True,
-                                protect=True,
-                            )
-                            self.mark_activity()
-                    else:
-                        pri = bool(cmd_l in _PRIORITY_SYSEX_CMDS)
-                        if is_numark and len(raw) < 700:
-                            pri = True
-                        coalesce_key = None
-                        if cmd_l in _COALESCE_SYSEX_CMDS and len(raw) > 10:
-                            coalesce_key = (
-                                cmd_l,
-                                side,
-                                int(raw[10]),
-                                pids[0] if pids else 0,
-                            )
-                        self.pass_q.put(
-                            (bulk, pids), priority=pri, coalesce_key=coalesce_key
-                        )
-                        self.mark_activity()
+                    # ALWAYS queue what VDJ sent — no coalesce_key, always protect
+                    self.pass_q.put(
+                        (bulk, pids),
+                        priority=True,
+                        protect=True,
+                    )
+                    self.mark_activity()
 
                     # Human-readable live stream (tail -f live-bridge.txt) — off
                     # by default. This runs on ~every incoming frame with no
@@ -1502,10 +1452,17 @@ class NvScreensDaemon:
                     name="nv-browser-keepalive",
                     daemon=True,
                 ).start()
-                print(
-                    f"[nv] VDJ/Wine input log → {vdj_csv_path}",
-                    flush=True,
-                )
+                if vdj_csv_path is not None:
+                    print(
+                        f"[nv] VDJ/Wine input log → {vdj_csv_path}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[nv] VDJ/Wine CSV log off "
+                        "(start with --vdj-csv PATH or NV_CSV_LOG=1 to enable)",
+                        flush=True,
+                    )
                 print(
                     "[nv] browser: knobs CC3/CC77; highlight-only safe "
                     "(no reverse-guess). mouse inject off "
@@ -1619,13 +1576,43 @@ class NvScreensDaemon:
                 time.sleep(pace)
         return ok, fail
 
-    def wake_lcds(self, *, reason: str = "start") -> None:
-        """Wake firmware with RAW bulk URBs, then live VDJ paints.
+    def _play_sysex_pid_seq(
+        self,
+        seq: list[tuple[int, bytes]],
+        *,
+        pace: float = 0.0,
+    ) -> tuple[int, int]:
+        """Pack (pid, SysEx) pairs to USB-MIDI bulk cells and write."""
+        from nv_screens.usb_midi_bulk import sysex_to_usb_midi
 
-        Re-encoded SysEx does NOT wake the NV panels. Order:
-          1) wake-open-plus-empty.bin (bulk-out open + empty chrome)
-          2) else empty-deck-bulk.bin
-          3) else bulk-out open-only / open actions
+        ok = fail = 0
+        for pid, msg in seq:
+            try:
+                bulk = sysex_to_usb_midi(msg)
+                if bulk and self.painter.write_bulk(
+                    bulk, pids=[pid], inter_chunk_s=0.0
+                ):
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception:
+                fail += 1
+            if pace:
+                time.sleep(pace)
+        return ok, fail
+
+    def wake_lcds(self, *, reason: str = "start") -> None:
+        """Wake firmware with RAW bulk open, then full Controllers chrome.
+
+        Open-only (0506/0508/0530) leaves the LCDs half-asleep / blank browser.
+        Full empty-deck-bulk.bin wakes well but ghosts capture library rows
+        (After Burn). Default path:
+
+          1) raw open-only bulk (firmware leave-logo)
+          2) sanitized EMPTY_DECK SysEx — full chrome, blank browser/title rows
+          3) live VDJ paint replaces blanks with real library
+
+        full/session: dump empty-deck-bulk as-is (debug).
         """
         with self._wake_lock:
             if self._lcd_woken and reason != "force":
@@ -1634,46 +1621,118 @@ class NvScreensDaemon:
 
             pace = float(getattr(self.args, "init_delay", 0.0) or 0.0005)
             t0 = time.perf_counter()
+            mode = str(self.wake_mode or "open").strip().lower()
 
-            # 1) Full clean wake from VDJ_start_stop_sequence (empty Controllers)
-            for label, path in (
-                ("empty-shell", WAKE_FULL_BIN),
-                ("open-only", WAKE_OPEN_ONLY_BIN),
-                ("hybrid-fallback", WAKE_HYBRID_BIN),
-            ):
-                if path.is_file() and self.wake_mode not in ("full", "all", "session"):
-                    ok, fail = self._play_bulk_bin(
-                        path, reason=f"{label}:{reason}", pace=pace
-                    )
-                    self._lcd_woken = True
-                    print(
-                        f"[nv] LCD wake done ({label}) ok={ok} fail={fail} "
-                        f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
-                        flush=True,
-                    )
-                    return
+            # Debug: raw capture dump (may include After Burn)
+            if mode in ("full", "all", "session"):
+                for label, path in (
+                    ("empty-shell", WAKE_FULL_BIN),
+                    ("hybrid-fallback", WAKE_HYBRID_BIN),
+                    ("open-only", WAKE_OPEN_ONLY_BIN),
+                ):
+                    if path.is_file():
+                        ok, fail = self._play_bulk_bin(
+                            path, reason=f"{label}:{reason}", pace=pace
+                        )
+                        self._lcd_woken = True
+                        print(
+                            f"[nv] LCD wake done ({label}) ok={ok} fail={fail} "
+                            f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
+                            flush=True,
+                        )
+                        return
 
-            # 2) Fallback: bulk-out open slice / actions
-            has_stream = bool(self.wake_actions or self.wake_records or self.bulk_records)
-            if has_stream and not getattr(self.args, "sysex_only", False):
-                ok, fail = self._play_wake_stream(reason=reason, pace=pace)
+            ok = fail = 0
+
+            # 1) Raw open bulk — required so firmware leaves logo
+            if WAKE_OPEN_ONLY_BIN.is_file():
+                o, f = self._play_bulk_bin(
+                    WAKE_OPEN_ONLY_BIN, reason=f"open-only:{reason}", pace=pace
+                )
+                ok += o
+                fail += f
+            elif WAKE_FULL_BIN.is_file():
+                # Last-resort raw: full dump, then blank overlay below
+                o, f = self._play_bulk_bin(
+                    WAKE_FULL_BIN, reason=f"empty-shell:{reason}", pace=pace
+                )
+                ok += o
+                fail += f
+
+            # 2) Full Controllers chrome with ghost library text stripped
+            try:
+                from nv_screens.win_lifecycle import empty_deck_wake_clean
+
+                chrome = empty_deck_wake_clean()
+            except Exception as e:
+                chrome = []
+                print(f"[nv] empty_deck_wake_clean note: {e}", flush=True)
+            if not chrome and self.empty_deck:
+                chrome = list(self.empty_deck)
+            if chrome:
+                o, f = self._play_sysex_pid_seq(chrome, pace=0.0)
+                ok += o
+                fail += f
+
+            self._lcd_woken = True
+            print(
+                f"[nv] LCD wake done (open+empty-chrome) ok={ok} fail={fail} "
+                f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next "
+                f"(browser blank until VDJ paints)",
+                flush=True,
+            )
+            if ok:
+                return
+
+            # Fallback: open-only actions extracted from bulk
+            if self.open_actions and not getattr(self.args, "sysex_only", False):
+                o, f = 0, 0
+                for kind, pid, payload in self.open_actions:
+                    try:
+                        if kind == "raw":
+                            self.painter.write_bulk(
+                                payload, pids=[pid], inter_chunk_s=0.0
+                            )
+                        else:
+                            from nv_screens.usb_midi_bulk import sysex_to_usb_midi
+
+                            self.painter.write_bulk(
+                                sysex_to_usb_midi(payload),
+                                pids=[pid],
+                                inter_chunk_s=0.0,
+                            )
+                        o += 1
+                    except Exception:
+                        f += 1
+                    if pace:
+                        time.sleep(pace)
                 self._lcd_woken = True
                 print(
-                    f"[nv] LCD wake done ok={ok} fail={fail} "
+                    f"[nv] LCD wake done (open-actions) ok={o} fail={f} "
                     f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
                     flush=True,
                 )
                 return
 
-            # 3) Last resort (often insufficient alone)
-            ok = fail = 0
+            has_stream = bool(self.wake_actions or self.wake_records or self.bulk_records)
+            if has_stream and not getattr(self.args, "sysex_only", False):
+                o, f = self._play_wake_stream(reason=reason, pace=pace)
+                self._lcd_woken = True
+                print(
+                    f"[nv] LCD wake done ok={o} fail={f} "
+                    f"in {(time.perf_counter() - t0) * 1000:.0f}ms — live VDJ next",
+                    flush=True,
+                )
+                return
+
+            o = f = 0
             for m in (self.init_msgs or [])[:40]:
                 if self.painter.write_sysex(m, inter_chunk_s=0.0):
-                    ok += 1
+                    o += 1
                 else:
-                    fail += 1
+                    f += 1
             self._lcd_woken = True
-            print(f"[nv] LCD sysex wake (weak) ok={ok} fail={fail}", flush=True)
+            print(f"[nv] LCD sysex wake (weak) ok={o} fail={f}", flush=True)
 
     def blank_lcds(self, *, reason: str = "shutdown") -> None:
         """ zero-chrome wipe while we still own bulk.
@@ -1866,11 +1925,15 @@ class NvScreensDaemon:
                 if sleep_for > 0:
                     self.stop.wait(sleep_for)
             if time.time() - last_stat >= 5.0:
-                print(
-                    f"[nv] {self.painter.stats.summary()} pass_dropped={self.pass_q.dropped} "
-                    f"frame_i={pi}",
-                    flush=True,
-                )
+                st = self.painter.stats
+                snap = (st.writes, st.fails, st.dropped, self.pass_q.dropped, pi)
+                if snap != getattr(self, "_paint_loop_snap", None):
+                    print(
+                        f"[nv] {st.summary()} pass_dropped={self.pass_q.dropped} "
+                        f"frame_i={pi}",
+                        flush=True,
+                    )
+                    self._paint_loop_snap = snap
                 last_stat = time.time()
 
     def live_loop(self) -> None:
@@ -1885,6 +1948,7 @@ class NvScreensDaemon:
             flush=True,
         )
         last_stat = time.time()
+        last_snap = None  # print bridge line only when counters change
         while not self.stop.is_set():
             # Timed-out partial browser gens (same generation only)
             for fr_side, frame in self._browser_asm.poll_timeouts():
@@ -1924,15 +1988,31 @@ class NvScreensDaemon:
                     payload, pids = item, None
                 self.painter.write_bulk(payload, pids=pids, inter_chunk_s=0.0)
                 self.mark_activity()
+            # Heartbeat only when counters move (or VDJ up/down flips).
             if time.time() - last_stat >= 5.0:
-                print(
-                    f"[nv] bridge {self.painter.stats.summary()} "
-                    f"pass_dropped={self.pass_q.dropped} "
-                    f"coalesced={getattr(self.pass_q, 'coalesced', 0)} "
-                    f"{self._browser_asm.summary()} "
-                    f"vdj={'up' if self._vdj_running else 'down'}",
-                    flush=True,
+                st = self.painter.stats
+                snap = (
+                    st.writes,
+                    st.fails,
+                    st.dropped,
+                    st.bytes_out,
+                    self.pass_q.dropped,
+                    getattr(self.pass_q, "coalesced", 0),
+                    self._browser_asm.frames_ok,
+                    self._browser_asm.partial_dropped,
+                    self._browser_asm.highlight_only,
+                    self._vdj_running,
                 )
+                if snap != last_snap:
+                    print(
+                        f"[nv] bridge {st.summary()} "
+                        f"pass_dropped={self.pass_q.dropped} "
+                        f"coalesced={getattr(self.pass_q, 'coalesced', 0)} "
+                        f"{self._browser_asm.summary()} "
+                        f"vdj={'up' if self._vdj_running else 'down'}",
+                        flush=True,
+                    )
+                    last_snap = snap
                 last_stat = time.time()
 
     def start_pass_through_listener(self) -> None:
@@ -2238,8 +2318,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wake-mode",
         choices=("open", "chrome", "full"),
         default=None,
-        help="LCD wake: open=init only, chrome=blank UI no capture titles (default), "
-        "full=entire bulk-out (old track flash). Env NV_WAKE_MODE overrides if unset.",
+        help="LCD wake: open|chrome = clean open shell only (no capture browser/"
+        "titles like After Burn); full = empty-deck-bulk dump (debug). "
+        "Env NV_WAKE_MODE overrides if unset.",
     )
     ap.add_argument(
         "--graphics-only",
@@ -2343,8 +2424,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--allow-sysex",
-        default="0509,0531,0505",
-        help="Comma-separated SysEx command hex codes to forward (e.g. 0509,0531)",
+        default="",
+        help="If set, only these Numark SysEx cmd hex codes are painted "
+        "(e.g. 0509,0531). Empty default = forward all display paint (required "
+        "for full track load UI).",
     )
     ap.add_argument(
         "--metadata-throttle-ms",

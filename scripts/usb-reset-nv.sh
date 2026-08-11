@@ -10,11 +10,11 @@
 #
 # There is NO logo SysEx in the capture. Logos = re-enum after wipe.
 #
-# Usage (passwordless after sudoers):
-#   sudo -n ~/src/nv-screens/scripts/usb-reset-nv.sh
+# Usage (passwordless after sudoers — path = YOUR install tree):
+#   sudo -n "$ROOT/scripts/usb-reset-nv.sh"
 #
-# Sudoers once:
-#   echo "$USER ALL=(root) NOPASSWD: /home/shane/src/nv-screens/scripts/usb-reset-nv.sh" \
+# Sudoers once (replace INSTALL_ROOT with your install folder):
+#   echo "$USER ALL=(root) NOPASSWD: INSTALL_ROOT/scripts/usb-reset-nv.sh" \
 #     | sudo tee /etc/sudoers.d/nv-screens-restore
 #   sudo chmod 440 /etc/sudoers.d/nv-screens-restore
 #

@@ -122,11 +122,13 @@ for i in "${WINE_OUTS[@]}"; do
 done
 
 # --- Facade 1:1: Wine outs = Control, Display Left, Display Right ---
-# Do NOT also wire Control (out 0) into vdj_in (double-handled LEDs).
+# Do NOT wire Control (out 0) into vdj_in (LED path is separate).
 if [[ -n "${GFX_USER:-}" ]]; then
+  # facade → Wine input (identity + HW control rebroadcast)
   for p in 0 1 2; do
     soft_conn "${GFX_USER}:$p" "${WINE}:0"
   done
+  # 1:1 wine output → facade port (do NOT mesh)
   map_n=${#WINE_OUTS[@]}
   for idx in 0 1 2; do
     if (( idx < map_n )); then
@@ -134,13 +136,14 @@ if [[ -n "${GFX_USER:-}" ]]; then
       echo "  map Wine:${WINE_OUTS[$idx]} → facade:$idx"
     fi
   done
-  # Paint SysEx taps: Display outs only
+  # Paint SysEx taps: Display outs only → host vdj_in (track load / browser)
   for idx in 1 2; do
     if (( idx < map_n )); then
       soft_conn "${WINE}:${WINE_OUTS[$idx]}" "${NVS}:0"
+      echo "  map Wine:${WINE_OUTS[$idx]} → vdj_in (paint)"
     fi
   done
-  echo "Wine ⟷ facade 1:1 (Control + Display L/R)"
+  echo "Wine ⟷ facade 1:1 (Control + Display L/R) + display→vdj_in paint"
 else
   echo "NOTE: no nv-screens-facade client yet (start nv-screens --patchbay)"
   for i in "${WINE_OUTS[@]}"; do
@@ -149,15 +152,13 @@ else
   echo "Wine outs → nv-screens:vdj_in (no facade)"
 fi
 
-# Kernel Control — proven working topology (user-confirmed in qpwgraph):
+# Kernel Control — proven topology:
 #   kernel CTL → facade:0     (HW jogs/pads into facade → Wine)
-#   Wine Control out → kernel CTL  (LEDs; missing this = no lights)
-#   Wine Control out → facade:0    (already mapped above 1:1)
+#   Wine Control out → kernel CTL  (LEDs)
 # Do NOT reverse facade→kernel (echo). Do NOT mesh all Wine outs to kernel.
 if [[ -n "${CTL:-}" ]]; then
   CTL_K=$(find_kernel_client "NV Control")
   CTL_ISO="${CTL_K:-$CTL}"
-  # Clear any bad links first
   for i in 0 1 2 3 4 5 6 7 8 9; do
     disc "${WINE}:$i" "${CTL_ISO}:0"
     disc "${CTL_ISO}:0" "${WINE}:$i"
@@ -165,7 +166,6 @@ if [[ -n "${CTL:-}" ]]; then
   if [[ -n "${GFX_USER:-}" ]]; then
     disc "${GFX_USER}:0" "${CTL_ISO}:0"
     soft_conn "${CTL_ISO}:0" "${GFX_USER}:0"
-    # Control stream = first Wine ALSA Output → real hardware LEDs
     if ((${#WINE_OUTS[@]} > 0)); then
       soft_conn "${WINE}:${WINE_OUTS[0]}" "${CTL_ISO}:0"
       echo "  map Wine:${WINE_OUTS[0]} → kernel NV Control (LEDs)"
