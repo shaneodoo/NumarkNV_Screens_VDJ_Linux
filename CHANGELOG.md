@@ -2,28 +2,36 @@
 
 ## 1.3.2 — 2026-08-11
 
-Portable install, full display paint, and a clean Controllers wake (no ghost library rows).
+Portable multi-machine install, reliable display paint forwarding, and Controllers wake without capture library chrome.
+
+### Added
+- **`tools/detect-nv.sh --write`** — scan connected USB interfaces and write `config/nv-ids.env` (VID/PIDs only).
+- **`install.sh` USB identity step** — runs detect on install; regenerates `config/udev/99-numark-nv.rules` from the detected vendor ID.
+- **`empty_deck_wake_clean()`** — Controllers chrome sequence with blank browser/title SysEx rows for wake.
+
+### Changed
+- **Live paint path** — all Numark display SysEx and short MIDI from display ports is forwarded to dual LCD bulk (no coalesce / soft-drop / metadata throttle on the live path). `--allow-sysex` is empty by default; set it only to restrict commands.
+- **MIDI graph (`wire_hybrid.sh`)** — Wine Display Left/Right outs also connect to `nv-screens:vdj_in` for paint; Control stays on the LED path (Wine Control out → kernel NV Control).
+- **LCD wake** — raw open-only bulk (`empty-deck-clean-bulk.bin`), then sanitized empty Controllers chrome; `wake-mode=full` still dumps the full empty-deck corpus for debug.
+- **Installer shortcuts** — `$NV_BIN_DIR` gets thin wrappers only (`ROOT` + `WINEPREFIX`); code always runs from the install tree.
+- **Logging** — high-rate SysEx samples are bootstrap-only; Control/CC samples are sparse; bridge stats print only when counters change.
+- **Patchbay buffers** — identity/emit pin tables use a fixed ring instead of unbounded keys.
 
 ### Fixed
-- **Track load / browser paint dropped.** Default `--allow-sysex` was filtering almost all Numark SysEx after a dead-code “fix”; default is empty again (forward all display paint). Display outs are wired back to `vdj_in` for paint.
-- **LCD ghost track “After Burn”** from wake capture. Full empty-deck dump embedded capture library chrome; open-only left panels half-asleep. Wake is now raw open + sanitized Controllers chrome (blank browser/title rows), then live VDJ paint.
-- **Machine-specific audio GUID / hard paths** removed from `vdj-set-nv-audio` and USB helpers — uses `WINEPREFIX`, `ROOT`, and the install tree only.
-
-### Added / Changed
-- **`install.sh` writes `config/nv-ids.env` from a live USB scan** (`tools/detect-nv.sh --write`); stock Numark NV factory IDs if the deck is unplugged. udev rules generated from detected VID.
-- **`~/bin` thin wrappers only** (start + vdj-set) → install tree; no second full copy of scripts.
-- Full VDJ display MIDI passthrough to LCD bulk; quieter logs; bounded patchbay identity buffers.
-- Display paint taps restored: Wine Display L/R → `vdj_in` (Control stays off that path for LEDs).
+- **`--allow-sysex` default** no longer restricted paint to `0509,0531,0505` only (that dropped browser/title/chrome tiles).
+- **`vdj-set-nv-audio.py`** — respects `WINEPREFIX` and install `ROOT` / `NV_IDS_ENV`; resolves Wine alsa GUID from the live prefix only (no hardcoded GUID); device XML path is install-relative.
+- **USB rebind / stock re-enum helpers** — resolve scripts from the package tree, not a fixed home path.
+- **`win_lifecycle` imports** — load `win_empty_deck_data` via the `nv_screens` package.
 
 ### Upgrade
 ```bash
 git pull
 ./install.sh
-# fully quit VirtualDJ, then:
+# fully quit VirtualDJ, then relaunch:
 start-virtualdj.sh
 ```
 
-Plug the NV in before install so USB IDs are taken from your device.
+Connect the controller before `./install.sh` so `nv-ids.env` is filled from the device. Re-scan later with `tools/detect-nv.sh --write`.
 
 ---
 
