@@ -1,9 +1,29 @@
 # VirtualDJ on Linux — Numark NV + video
 
-Dual LCD screens and factory-style controllers for the **Numark NV**, plus a
-**DXVK** stack so 64-bit VirtualDJ can show **deck video / karaoke** under Wine.
-
 Not an official Atomix product. Community glue that runs on a normal Linux box.
+
+## Why this exists
+
+I run VirtualDJ on Linux under Wine. The **Numark NV** is a great dual-screen
+controller on Windows, but on Linux the two LCD decks never woke up properly —
+the pads and jogs could work, the audio could work, and the screens stayed
+stuck on logos or garbage. VirtualDJ’s own video path under Wine was also a
+pain without a working DXVK setup.
+
+So this project is the missing middle layer: a small host that claims the NV’s
+screen USB interfaces, wakes the panels, and paints whatever VirtualDJ is
+sending (browser, waveforms, titles) onto the real LCDs, while keeping the
+Control surface and sound on the normal Linux/ALSA path. One launcher starts
+the host, wires MIDI, and opens VirtualDJ. Optional DXVK is included so deck
+video and karaoke can show up under Wine as well.
+
+**Who it’s for:** Linux DJs who already use (or want to use) VirtualDJ with a
+Numark NV and don’t want to keep a Windows box just for the screens. If you
+only care about video under Wine, the DXVK bits help even without the hardware.
+If you don’t have an NV, this won’t invent one — it only bridges what the deck
+and VirtualDJ already do.
+
+Everything below is the practical stuff: install, run, layout, requirements.
 
 | USB device   | ID          | Role              |
 |--------------|-------------|-------------------|
