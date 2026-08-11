@@ -298,8 +298,12 @@ class NvBulkPainter:
             print("[nv] NV Audio sysfs path not found for PCM rebind", flush=True)
             return
 
-        # Prefer external helper (may use sudo) so bind/unbind work
-        helper = Path.home() / "src/nv-screens/tools/rebind-nv-audio-pcm.sh"
+        # Prefer external helper (may use sudo) so bind/unbind work.
+        # Always relative to this install tree — never a fixed home path.
+        _root = Path(__file__).resolve().parents[1]
+        helper = _root / "tools" / "rebind-nv-audio-pcm.sh"
+        if not helper.is_file():
+            helper = _root / "scripts" / "rebind-nv-audio-pcm.sh"
         if helper.is_file() and os.access(helper, os.X_OK):
             import subprocess
 
@@ -320,7 +324,7 @@ class NvBulkPainter:
         drv = Path("/sys/bus/usb/drivers/snd-usb-audio")
         for ifn in (0, 2):  # AudioControl + AudioStreaming on NV Audio
             ifname = f"{devpath.name}:1.{ifn}"
-            ifp = devpath.parent / ifname if False else Path(f"/sys/bus/usb/devices/{ifname}")
+            ifp = Path(f"/sys/bus/usb/devices/{ifname}")
             if not ifp.exists():
                 ifp = Path(f"/sys/bus/usb/devices/{devpath.name}:1.{ifn}")
             try:
@@ -507,12 +511,12 @@ class NvBulkPainter:
         """
         import subprocess
 
-        tools = Path(__file__).resolve().parents[1] / "tools"
-        if not tools.is_dir():
-            tools = Path.home() / "src/nv-screens/tools"
-        usb_script = tools / "usb-reset-nv.sh"
+        _root = Path(__file__).resolve().parents[1]
+        usb_script = _root / "tools" / "usb-reset-nv.sh"
         if not usb_script.is_file():
-            print(f"[nv] missing {usb_script}", flush=True)
+            usb_script = _root / "scripts" / "usb-reset-nv.sh"
+        if not usb_script.is_file():
+            print(f"[nv] missing usb-reset-nv.sh under {_root}", flush=True)
             return False
 
         time.sleep(0.35)

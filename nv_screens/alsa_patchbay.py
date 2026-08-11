@@ -537,12 +537,11 @@ class _SeqClient:
             return False
         self._ctl_kern_client = kern_id
         self._ctl_port_id = port_id
-        # Hardware → facade only. Wine→LED is a single _forward_raw_to_kernel_control.
-        # Reverse ALSA link + rebroadcast echoed MIDI and flashed LEDs off.
+        # HW → facade only. LEDs: aconnect Wine Control out → kernel (wire_hybrid).
         e1 = _asound.snd_seq_connect_from(self._seq, port_id, kern_id, 0)
         print(
             f"[patchbay] Control bridge kernel {kern_id}:0 → facade:"
-            f"{control_port_name!r}({port_id}) (from={e1}; LED=single forward)",
+            f"{control_port_name!r}({port_id}) (from={e1}; LEDs via ALSA wire)",
             flush=True,
         )
         return e1 >= 0
@@ -609,9 +608,11 @@ class _SeqClient:
         """Rebroadcast SysEx (e.g. from hardware) to Wine subscribers."""
         if not self._seq or not payload:
             return
-        key = f"emit-{port_id}-{len(payload)}-{id(payload)}"
+        # Pin buffer until ALSA has copied it; keep a small rotating set only
+        # (id(payload) keys grew without bound during long sessions).
         buf = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
-        self._id_bufs[key] = buf  # pin
+        slot = f"emit-{port_id}-{self.stats.get('ctl_hw', 0) % 32}"
+        self._id_bufs[slot] = buf
         ev = _SndSeqEvent()
         ev.type = SND_SEQ_EVENT_SYSEX
         ev.flags = SND_SEQ_EVENT_LENGTH_VARIABLE
@@ -684,7 +685,8 @@ class _SeqClient:
         # SysEx path
         if raw[0] == 0xF0:
             buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
-            self._id_bufs[f"fwd-{id(buf)}"] = buf
+            slot = f"fwd-{port_id}-{self.stats.get('ctl_wine', 0) % 32}"
+            self._id_bufs[slot] = buf
             ev = _SndSeqEvent()
             ev.type = SND_SEQ_EVENT_SYSEX
             ev.flags = SND_SEQ_EVENT_LENGTH_VARIABLE
@@ -951,9 +953,9 @@ class _SeqClient:
                                     self.on_control_midi(raw)
                                 except Exception:
                                     pass
-                            # Throttled log: proves FX knobs/jogs reach the bridge
+                            # Sparse sample only — Control chatters even when idle.
                             n_hw = self.stats.get("ctl_hw", 0)
-                            if n_hw <= 12 or n_hw % 200 == 0:
+                            if n_hw <= 8 or n_hw % 2000 == 0:
                                 hx = raw[:8].hex()
                                 print(
                                     f"[patchbay] ctl HW→Wine #{n_hw} "
@@ -962,12 +964,10 @@ class _SeqClient:
                                     flush=True,
                                 )
                             continue
-                        # Wine → Control LEDs: delivered by ALSA
-                        #   aconnect Wine:ControlOut → kernel NV Control
-                        # (see wire_hybrid.sh). Do NOT also _forward_raw here
-                        # or LEDs get every message twice.
+                        # Wine → LEDs via ALSA (wire_hybrid: Wine out → kernel).
+                        # Do not also Python-forward (double MIDI).
                         if src_cli is not None and src_cli == self.client_id:
-                            continue  # ignore our own HW rebroadcast
+                            continue
                         if self._is_identity_request(raw):
                             continue
                         owc = getattr(self, "on_wine_control", None)
@@ -978,7 +978,7 @@ class _SeqClient:
                                 pass
                         n_wc = self.stats.get("ctl_wine", 0) + 1
                         self.stats["ctl_wine"] = n_wc
-                        if n_wc <= 12 or n_wc % 500 == 0:
+                        if n_wc <= 8 or n_wc % 2000 == 0:
                             print(
                                 f"[patchbay] ctl Wine→LED #{n_wc} "
                                 f"hex={raw[:6].hex()} (alsa wire)",
@@ -1027,19 +1027,29 @@ class _SeqClient:
                             pass
 
                     if kind == "sysex":
-                        # Browser list (0524) floods ~14 tiles/click — don't stall
-                        # the input pump printing every frame.
+                        # High-rate paint tiles: bootstrap sample only (VDJ keeps
+                        # re-emitting 050a/chrome even when the user is idle).
                         cmd_h = raw[4:6].hex() if len(raw) >= 6 else ""
-                        self.stats["sysex_by_cmd"] = self.stats.get("sysex_by_cmd", 0)
                         n_sx = self.stats["sysex"]
-                        spammy = cmd_h in ("0524", "050a", "0505", "0509")
-                        if (not spammy) or n_sx <= 8 or n_sx % 40 == 0:
+                        spammy = cmd_h in (
+                            "0524", "050a", "0505", "0509", "0521", "0520", "0522", "0523",
+                        )
+                        by_cmd = self.stats.setdefault("sysex_cmd_log", {})
+                        n_cmd = by_cmd.get(cmd_h, 0) + 1
+                        by_cmd[cmd_h] = n_cmd
+                        if spammy:
+                            # First 2 of each spam cmd, then silence forever
+                            log_sx = n_cmd <= 2
+                        else:
+                            # Rare cmds: first 8 overall, then every 500
+                            log_sx = n_sx <= 8 or n_sx % 500 == 0
+                        if log_sx:
                             print(
                                 f"[patchbay] SYSEX {port_name} len={len(raw)} "
                                 f"cmd={cmd_h or '-'} {raw[:20].hex()}…",
                                 flush=True,
                             )
-                    elif self.stats["events"] <= 20 or self.stats["events"] % 200 == 0:
+                    elif self.stats["events"] <= 12 or self.stats["events"] % 2000 == 0:
                         print(
                             f"[patchbay] {self.client_name} in #{self.stats['events']} "
                             f"{kind} {port_name} ch={ch} d1={d1} d2={d2} "

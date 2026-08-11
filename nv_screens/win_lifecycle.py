@@ -150,13 +150,57 @@ def close_then_reopen() -> list[tuple[int, bytes]]:
 
 def empty_deck_sequence() -> list[tuple[int, bytes]]:
     """Open + full empty Controllers chrome (no track 0509). Left then Right."""
-    from win_empty_deck_data import EMPTY_DECK
+    from nv_screens.win_empty_deck_data import EMPTY_DECK
     return list(EMPTY_DECK)
+
+
+def empty_deck_wake_clean() -> list[tuple[int, bytes]]:
+    """Full Controllers chrome with capture track/browser text blanked.
+
+    The stock empty-deck capture still embeds a ghost library row (e.g. After
+    Burn). Open-only (0506/0508/0530) leaves the panels half-asleep / blank.
+    This keeps open + chrome (0501/0502/0507/…) and zeroes 0521 title lines
+    plus non-empty 0524 browser strips so the LCD wakes fully without a fake
+    track list. Live VDJ paint replaces it next.
+    """
+    from nv_screens.win_empty_deck_data import EMPTY_DECK
+
+    # Blank 0524 row templates: strip index 1..6 are already empty rows.
+    blank_0524: dict[int, bytes] = {}
+    for pid, m in EMPTY_DECK:
+        if len(m) < 12 or m[0] != 0xF0 or m[4:6] != b"\x05\x24":
+            continue
+        strip = m[10]
+        body_nz = sum(1 for b in m[11:-1] if b)
+        if strip != 0 and body_nz <= 12:
+            # Retarget this empty row to strip 0 later
+            blank_0524[pid] = m
+
+    out: list[tuple[int, bytes]] = []
+    for pid, m in EMPTY_DECK:
+        if len(m) < 6 or m[0] != 0xF0:
+            out.append((pid, m))
+            continue
+        cmd = m[4:6].hex()
+        if cmd == "0521":
+            # Keep product + line index header; zero glyph payload (no After Burn)
+            nm = bytearray(m)
+            for i in range(11, len(nm) - 1):
+                nm[i] = 0
+            out.append((pid, bytes(nm)))
+        elif cmd == "0524" and m[10] == 0 and pid in blank_0524:
+            tmpl = bytearray(blank_0524[pid])
+            tmpl[2] = m[2]  # product family byte
+            tmpl[10] = 0  # strip 0
+            out.append((pid, bytes(tmpl)))
+        else:
+            out.append((pid, m))
+    return out
 
 
 def full_close_sequence() -> list[tuple[int, bytes]]:
     """File→Exit tail from same capture (status clear on both LCDs)."""
-    from win_empty_deck_data import CLOSE_SEQ
+    from nv_screens.win_empty_deck_data import CLOSE_SEQ
     return list(CLOSE_SEQ)
 
 

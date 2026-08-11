@@ -2,7 +2,10 @@
 # Point Wine/VDJ at Numark NV audio and drop shadowing display XML.
 set -euo pipefail
 
-ROOT="${ROOT:-$HOME/src/nv-screens}"
+# Prefer ROOT from launcher; else directory that contains this scripts/ folder
+if [[ -z "${ROOT:-}" ]]; then
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
 export WINEPREFIX
 VDJ_DEV="$WINEPREFIX/drive_c/users/$USER/AppData/Local/VirtualDJ/Devices"

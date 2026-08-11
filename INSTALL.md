@@ -66,11 +66,19 @@ Answer **Y** for DXVK when asked (enables deck video / karaoke under Wine).
 
 | Step | Action |
 |------|--------|
-| Tree | Copies to `~/src/nv-screens` by default |
-| Launcher | `~/bin/start-virtualdj.sh` + app menu |
+| Tree | Copies to `$NV_INSTALL_ROOT` (default `~/src/nv-screens`) |
+| **USB IDs** | Scans your plugged-in deck and writes `config/nv-ids.env` (stock NV IDs if unplugged) |
+| udev | Rules generated from that VID (optional password) |
+| Launcher | Thin wrappers in `~/bin` → install tree (no second full copy) |
 | **DXVK** | Native d3d11/d3d9/dxgi into your Wine prefix |
-| udev | USB rules for NV bulk LCD (optional password) |
 | Hint | sudoers line for logo restore on quit |
+
+Plug the Numark NV in before `./install.sh` so IDs are taken from **your** USB bus. Re-scan later:
+
+```bash
+$NV_INSTALL_ROOT/tools/detect-nv.sh --write
+# default: ~/src/nv-screens/tools/detect-nv.sh --write
+```
 
 ### Useful env vars
 
@@ -81,6 +89,7 @@ Answer **Y** for DXVK when asked (enables deck video / karaoke under Wine).
 | `NV_BIN_DIR` | Where the launcher goes (default `~/bin`) |
 | `NV_INSTALL_DXVK=0` | Skip video DLL install |
 | `NV_INSTALL_YES=1` | Non-interactive (yes to prompts) |
+| `NV_IDS_ENV` | Override path to `nv-ids.env` (advanced) |
 
 ## 4. DXVK only (video, any prefix)
 
@@ -117,6 +126,7 @@ sudo visudo
 
 ```text
 YOURUSER ALL=(root) NOPASSWD: /home/YOURUSER/src/nv-screens/scripts/usb-reset-nv.sh
+# (path = wherever you installed; install.sh prints the exact line)
 ```
 
 ## 7. Start

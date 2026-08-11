@@ -16,10 +16,8 @@ from pathlib import Path
 # config/ and nv_screens/ are sibling directories under the install root.
 _ENV_PATH = Path(__file__).resolve().parent.parent / "config" / "nv-ids.env"
 
-# Fallback values used only if config/nv-ids.env is missing or unreadable
-# (e.g. this file was copied somewhere standalone). Keeps every consumer
-# working even in that edge case, but config/nv-ids.env is the real source
-# of truth.
+# Fallback = stock Numark NV factory product IDs (not machine-specific).
+# Real installs get config/nv-ids.env from tools/detect-nv.sh / install.sh.
 _DEFAULTS = {
     "NV_VID": "15e4",
     "NV_PID_CONTROL": "1005",
@@ -45,7 +43,24 @@ def _load(path: Path) -> dict[str, str]:
     return values
 
 
-_RAW = {**_DEFAULTS, **_load(_ENV_PATH)}
+def _env_paths() -> list[Path]:
+    paths: list[Path] = []
+    override = __import__("os").environ.get("NV_IDS_ENV", "").strip()
+    if override:
+        paths.append(Path(override).expanduser())
+    root = __import__("os").environ.get("ROOT", "").strip()
+    if root:
+        paths.append(Path(root).expanduser() / "config" / "nv-ids.env")
+    paths.append(_ENV_PATH)
+    return paths
+
+
+_RAW = dict(_DEFAULTS)
+for _p in _env_paths():
+    loaded = _load(_p)
+    if loaded:
+        _RAW.update(loaded)
+        break
 
 VID: int = int(_RAW["NV_VID"], 16)
 PID_CONTROL: int = int(_RAW["NV_PID_CONTROL"], 16)

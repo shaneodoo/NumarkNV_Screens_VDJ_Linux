@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.3.2 — 2026-08-11
+
+Portable install, full display paint, and a clean Controllers wake (no ghost library rows).
+
+### Fixed
+- **Track load / browser paint dropped.** Default `--allow-sysex` was filtering almost all Numark SysEx after a dead-code “fix”; default is empty again (forward all display paint). Display outs are wired back to `vdj_in` for paint.
+- **LCD ghost track “After Burn”** from wake capture. Full empty-deck dump embedded capture library chrome; open-only left panels half-asleep. Wake is now raw open + sanitized Controllers chrome (blank browser/title rows), then live VDJ paint.
+- **Machine-specific audio GUID / hard paths** removed from `vdj-set-nv-audio` and USB helpers — uses `WINEPREFIX`, `ROOT`, and the install tree only.
+
+### Added / Changed
+- **`install.sh` writes `config/nv-ids.env` from a live USB scan** (`tools/detect-nv.sh --write`); stock Numark NV factory IDs if the deck is unplugged. udev rules generated from detected VID.
+- **`~/bin` thin wrappers only** (start + vdj-set) → install tree; no second full copy of scripts.
+- Full VDJ display MIDI passthrough to LCD bulk; quieter logs; bounded patchbay identity buffers.
+- Display paint taps restored: Wine Display L/R → `vdj_in` (Control stays off that path for LEDs).
+
+### Upgrade
+```bash
+git pull
+./install.sh
+# fully quit VirtualDJ, then:
+start-virtualdj.sh
+```
+
+Plug the NV in before install so USB IDs are taken from your device.
+
+---
+
 ## 1.3.1 — 2026-08-10
 
 Controller LEDs and MIDI wiring fix. Screens already painted; buttons/LEDs were flaky because the Control path was half-connected.
